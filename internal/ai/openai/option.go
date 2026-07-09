@@ -1,24 +1,15 @@
-package option
+package openai
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
-
-	"github.com/tidwall/sjson"
-	requestconfig "github.com/zhongys/Daksha.git/internal/ai/sdk/requestConfig"
 )
-
-// RequestOption is an option for the requests made by the openai API Client
-// which can be supplied to clients, services, and methods. You can read more about this functional
-// options pattern in our [README].
-//
-// [README]: https://pkg.go.dev/github.com/openai/openai-go#readme-requestoptions
-type RequestOption = requestconfig.RequestOption
 
 // WithBaseURL returns a RequestOption that sets the BaseURL for the client.
 //
@@ -29,7 +20,7 @@ func WithBaseURL(base string) RequestOption {
 		u.Path += "/"
 	}
 
-	return requestconfig.RequestOptionFunc(func(r *requestconfig.RequestConfig) error {
+	return RequestOptionFunc(func(r *RequestConfig) error {
 		if err != nil {
 			return fmt.Errorf("requestoption: WithBaseURL failed to parse url %s", err)
 		}
@@ -50,11 +41,8 @@ type HTTPClient interface {
 
 // WithHTTPClient returns a RequestOption that changes the underlying http client used to make this
 // request, which by default is [http.DefaultClient].
-//
-// For custom uses cases, it is recommended to provide an [*http.Client] with a custom
-// [http.RoundTripper] as its transport, rather than directly implementing [HTTPClient].
 func WithHTTPClient(client HTTPClient) RequestOption {
-	return requestconfig.RequestOptionFunc(func(r *requestconfig.RequestConfig) error {
+	return RequestOptionFunc(func(r *RequestConfig) error {
 		if client == nil {
 			return fmt.Errorf("requestoption: custom http client cannot be nil")
 		}
@@ -74,7 +62,7 @@ func WithHTTPClient(client HTTPClient) RequestOption {
 // WithHeader returns a RequestOption that sets the header value to the associated key. It overwrites
 // any value if there was one already present.
 func WithHeader(key, value string) RequestOption {
-	return requestconfig.RequestOptionFunc(func(r *requestconfig.RequestConfig) error {
+	return RequestOptionFunc(func(r *RequestConfig) error {
 		r.SetHeader(key, value)
 		return nil
 	})
@@ -83,7 +71,7 @@ func WithHeader(key, value string) RequestOption {
 // WithHeaderAdd returns a RequestOption that adds the header value to the associated key. It appends
 // onto any existing values.
 func WithHeaderAdd(key, value string) RequestOption {
-	return requestconfig.RequestOptionFunc(func(r *requestconfig.RequestConfig) error {
+	return RequestOptionFunc(func(r *RequestConfig) error {
 		r.AddHeader(key, value)
 		return nil
 	})
@@ -91,7 +79,7 @@ func WithHeaderAdd(key, value string) RequestOption {
 
 // WithHeaderDel returns a RequestOption that deletes the header value(s) associated with the given key.
 func WithHeaderDel(key string) RequestOption {
-	return requestconfig.RequestOptionFunc(func(r *requestconfig.RequestConfig) error {
+	return RequestOptionFunc(func(r *RequestConfig) error {
 		r.DelHeader(key)
 		return nil
 	})
@@ -100,7 +88,7 @@ func WithHeaderDel(key string) RequestOption {
 // WithQuery returns a RequestOption that sets the query value to the associated key. It overwrites
 // any value if there was one already present.
 func WithQuery(key, value string) RequestOption {
-	return requestconfig.RequestOptionFunc(func(r *requestconfig.RequestConfig) error {
+	return RequestOptionFunc(func(r *RequestConfig) error {
 		query := r.Request.URL.Query()
 		query.Set(key, value)
 		r.Request.URL.RawQuery = query.Encode()
@@ -111,7 +99,7 @@ func WithQuery(key, value string) RequestOption {
 // WithQueryAdd returns a RequestOption that adds the query value to the associated key. It appends
 // onto any existing values.
 func WithQueryAdd(key, value string) RequestOption {
-	return requestconfig.RequestOptionFunc(func(r *requestconfig.RequestConfig) error {
+	return RequestOptionFunc(func(r *RequestConfig) error {
 		query := r.Request.URL.Query()
 		query.Add(key, value)
 		r.Request.URL.RawQuery = query.Encode()
@@ -121,7 +109,7 @@ func WithQueryAdd(key, value string) RequestOption {
 
 // WithQueryDel returns a RequestOption that deletes the query value(s) associated with the key.
 func WithQueryDel(key string) RequestOption {
-	return requestconfig.RequestOptionFunc(func(r *requestconfig.RequestConfig) error {
+	return RequestOptionFunc(func(r *RequestConfig) error {
 		query := r.Request.URL.Query()
 		query.Del(key)
 		r.Request.URL.RawQuery = query.Encode()
@@ -129,58 +117,79 @@ func WithQueryDel(key string) RequestOption {
 	})
 }
 
-// WithJSONSet returns a RequestOption that sets the body's JSON value associated with the key.
-// The key accepts a string as defined by the [sjson format].
-//
-// [sjson format]: https://github.com/tidwall/sjson
+// WithJSONSet returns a RequestOption that sets the top-level key of the
+// serialized JSON body to the given value. The body must be a JSON object.
 func WithJSONSet(key string, value any) RequestOption {
-	return requestconfig.RequestOptionFunc(func(r *requestconfig.RequestConfig) (err error) {
-		var b []byte
+	return RequestOptionFunc(func(r *RequestConfig) (err error) {
+		m := map[string]json.RawMessage{}
 
-		if r.Body == nil {
-			b, err = sjson.SetBytes(nil, key, value)
-			if err != nil {
-				return err
+		if r.Body != nil {
+			buffer, ok := r.Body.(*bytes.Buffer)
+			if !ok {
+				return fmt.Errorf("cannot use WithJSONSet on a body that is not serialized as *bytes.Buffer")
 			}
-		} else if buffer, ok := r.Body.(*bytes.Buffer); ok {
-			b = buffer.Bytes()
-			b, err = sjson.SetBytes(b, key, value)
-			if err != nil {
-				return err
+			if buffer.Len() > 0 {
+				if err := json.Unmarshal(buffer.Bytes(), &m); err != nil {
+					return err
+				}
 			}
-		} else {
-			return fmt.Errorf("cannot use WithJSONSet on a body that is not serialized as *bytes.Buffer")
 		}
 
+		raw, err := jsonMarshalNoEscape(value)
+		if err != nil {
+			return err
+		}
+		m[key] = raw
+
+		b, err := jsonMarshalNoEscape(m)
+		if err != nil {
+			return err
+		}
 		r.Body = bytes.NewBuffer(b)
 		return nil
 	})
 }
 
-// WithJSONDel returns a RequestOption that deletes the body's JSON value associated with the key.
-// The key accepts a string as defined by the [sjson format].
-//
-// [sjson format]: https://github.com/tidwall/sjson
+// WithJSONDel returns a RequestOption that deletes the top-level key from the
+// serialized JSON body. The body must be a JSON object.
 func WithJSONDel(key string) RequestOption {
-	return requestconfig.RequestOptionFunc(func(r *requestconfig.RequestConfig) (err error) {
-		if buffer, ok := r.Body.(*bytes.Buffer); ok {
-			b := buffer.Bytes()
-			b, err = sjson.DeleteBytes(b, key)
-			if err != nil {
-				return err
-			}
-			r.Body = bytes.NewBuffer(b)
-			return nil
+	return RequestOptionFunc(func(r *RequestConfig) (err error) {
+		buffer, ok := r.Body.(*bytes.Buffer)
+		if !ok {
+			return fmt.Errorf("cannot use WithJSONDel on a body that is not serialized as *bytes.Buffer")
 		}
 
-		return fmt.Errorf("cannot use WithJSONDel on a body that is not serialized as *bytes.Buffer")
+		m := map[string]json.RawMessage{}
+		if buffer.Len() > 0 {
+			if err := json.Unmarshal(buffer.Bytes(), &m); err != nil {
+				return err
+			}
+		}
+		delete(m, key)
+
+		b, err := jsonMarshalNoEscape(m)
+		if err != nil {
+			return err
+		}
+		r.Body = bytes.NewBuffer(b)
+		return nil
 	})
+}
+
+func jsonMarshalNoEscape(v any) ([]byte, error) {
+	buf := new(bytes.Buffer)
+	enc := json.NewEncoder(buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	return bytes.TrimRight(buf.Bytes(), "\n"), nil
 }
 
 // WithResponseBodyInto returns a RequestOption that overwrites the deserialization target with
 // the given destination. If provided, we don't deserialize into the default struct.
 func WithResponseBodyInto(dst any) RequestOption {
-	return requestconfig.RequestOptionFunc(func(r *requestconfig.RequestConfig) error {
+	return RequestOptionFunc(func(r *RequestConfig) error {
 		r.ResponseBodyInto = dst
 		return nil
 	})
@@ -188,7 +197,7 @@ func WithResponseBodyInto(dst any) RequestOption {
 
 // WithResponseInto returns a RequestOption that copies the [*http.Response] into the given address.
 func WithResponseInto(dst **http.Response) RequestOption {
-	return requestconfig.RequestOptionFunc(func(r *requestconfig.RequestConfig) error {
+	return RequestOptionFunc(func(r *RequestConfig) error {
 		r.ResponseInto = dst
 		return nil
 	})
@@ -199,7 +208,7 @@ func WithResponseInto(dst **http.Response) RequestOption {
 //
 // body accepts an io.Reader or raw []bytes.
 func WithRequestBody(contentType string, body any) RequestOption {
-	return requestconfig.RequestOptionFunc(func(r *requestconfig.RequestConfig) error {
+	return RequestOptionFunc(func(r *RequestConfig) error {
 		if reader, ok := body.(io.Reader); ok {
 			r.Body = reader
 			return r.Apply(WithHeader("Content-Type", contentType))
@@ -218,22 +227,16 @@ func WithRequestBody(contentType string, body any) RequestOption {
 // each request attempt. This should be smaller than the timeout defined in
 // the context, which spans all retries.
 func WithRequestTimeout(dur time.Duration) RequestOption {
-	return requestconfig.RequestOptionFunc(func(r *requestconfig.RequestConfig) error {
+	return RequestOptionFunc(func(r *RequestConfig) error {
 		r.RequestTimeout = dur
 		return nil
 	})
 }
 
-// WithEnvironmentProduction returns a RequestOption that sets the current
-// environment to be the "production" environment. An environment specifies which base URL
-// to use by default.
-func WithEnvironmentProduction() RequestOption {
-	return requestconfig.WithDefaultBaseURL("https://api.openai.com/v1/")
-}
-
-// WithAPIKey returns a RequestOption that sets the client setting "api_key".
+// WithAPIKey returns a RequestOption that sets the client's API key, sent as
+// a Bearer token.
 func WithAPIKey(value string) RequestOption {
-	return requestconfig.RequestOptionFunc(func(r *requestconfig.RequestConfig) error {
+	return RequestOptionFunc(func(r *RequestConfig) error {
 		r.SetAPIKey(value)
 		return nil
 	})

@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"time"
 
-	requestconfig "github.com/zhongys/Daksha.git/internal/ai/sdk/requestConfig"
+	"github.com/zhongys/Daksha/internal/ai/openai"
 )
 
 func main() {
@@ -20,14 +20,14 @@ func main() {
 
 	var response interface{}
 
-	err := requestconfig.ExecuteNewRequest(
+	err := openai.ExecuteNewRequest(
 		context.Background(),
 		http.MethodPost,
 		"/chat/completions",
 		body,
 		&response,
-		requestconfig.WithDefaultBaseURL(""),
-		requestconfig.RequestOptionFunc(func(cfg *requestconfig.RequestConfig) error {
+		openai.WithDefaultBaseURL(""),
+		openai.RequestOptionFunc(func(cfg *openai.RequestConfig) error {
 			cfg.SetAPIKey("")
 			cfg.RequestTimeout = 30 * time.Second
 			return nil

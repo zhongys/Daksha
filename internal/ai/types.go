@@ -1,4 +1,4 @@
-package agent
+package ai
 
 type Role string
 

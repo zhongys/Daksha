@@ -1,4 +1,4 @@
-package ssestream
+package openai
 
 import (
 	"bufio"
@@ -7,9 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 
-	"github.com/tidwall/gjson"
+	"github.com/zhongys/Daksha/internal/ai"
 )
 
 type Decoder interface {
@@ -24,22 +23,9 @@ func NewDecoder(res *http.Response) Decoder {
 		return nil
 	}
 
-	var decoder Decoder
-	contentType := res.Header.Get("content-type")
-	if t, ok := decoderTypes[contentType]; ok {
-		decoder = t(res.Body)
-	} else {
-		scn := bufio.NewScanner(res.Body)
-		scn.Buffer(nil, bufio.MaxScanTokenSize<<9)
-		decoder = &eventStreamDecoder{rc: res.Body, scn: scn}
-	}
-	return decoder
-}
-
-var decoderTypes = map[string](func(io.ReadCloser) Decoder){}
-
-func RegisterDecoder(contentType string, decoder func(io.ReadCloser) Decoder) {
-	decoderTypes[strings.ToLower(contentType)] = decoder
+	scn := bufio.NewScanner(res.Body)
+	scn.Buffer(nil, bufio.MaxScanTokenSize<<9)
+	return &eventStreamDecoder{rc: res.Body, scn: scn}
 }
 
 type Event struct {
@@ -96,7 +82,7 @@ func (s *eventStreamDecoder) Next() bool {
 
 		switch string(name) {
 		case "":
-			// An empty line in the for ": something" is a comment and should be ignored.
+			// A line in the form ": something" is a comment and should be ignored.
 			continue
 		case "event":
 			event = string(value)
@@ -132,11 +118,10 @@ func (s *eventStreamDecoder) Err() error {
 }
 
 type Stream[T any] struct {
-	decoder             Decoder
-	cur                 T
-	err                 error
-	done                bool
-	synthesizeEventData bool
+	decoder Decoder
+	cur     T
+	err     error
+	done    bool
 }
 
 func NewStream[T any](decoder Decoder, err error) *Stream[T] {
@@ -146,25 +131,17 @@ func NewStream[T any](decoder Decoder, err error) *Stream[T] {
 	}
 }
 
-func NewStreamWithSynthesizeEventData[T any](decoder Decoder, err error) *Stream[T] {
-	return &Stream[T]{
-		decoder:             decoder,
-		err:                 err,
-		synthesizeEventData: true,
-	}
-}
-
 // Next returns false if the stream has ended or an error occurred.
 // Call Stream.Current() to get the current value.
 // Call Stream.Err() to get the error.
 //
-//		for stream.Next() {
-//			data := stream.Current()
-//		}
+//	for stream.Next() {
+//		data := stream.Current()
+//	}
 //
-//	 	if stream.Err() != nil {
-//			...
-//	 	}
+//	if stream.Err() != nil {
+//		...
+//	}
 func (s *Stream[T]) Next() bool {
 	if s.err != nil {
 		return false
@@ -181,36 +158,16 @@ func (s *Stream[T]) Next() bool {
 			continue
 		}
 
-		ep := gjson.GetBytes(s.decoder.Event().Data, "error")
-		if ep.Exists() {
+		if apiErr := ai.ErrorFromEventData(s.decoder.Event().Data); apiErr != nil {
 			s.err = &StreamError{
-				Message: fmt.Sprintf("received error while streaming: %s", ep.String()),
+				Message: fmt.Sprintf("received error while streaming: %s", apiErr.Message),
 				Event:   s.decoder.Event(),
 			}
 			return false
 		}
+
 		var nxt T
-		data := s.decoder.Event().Data
-		if s.decoder.Event().Type != "" && strings.HasPrefix(s.decoder.Event().Type, "thread.") {
-			synthesized := map[string]any{
-				"event": s.decoder.Event().Type,
-				"data":  json.RawMessage(data),
-			}
-			data, s.err = json.Marshal(synthesized)
-			if s.err != nil {
-				return false
-			}
-		} else if s.synthesizeEventData {
-			synthesized := map[string]any{
-				"event": s.decoder.Event().Type,
-				"data":  json.RawMessage(data),
-			}
-			data, s.err = json.Marshal(synthesized)
-			if s.err != nil {
-				return false
-			}
-		}
-		s.err = json.Unmarshal(data, &nxt)
+		s.err = json.Unmarshal(s.decoder.Event().Data, &nxt)
 		if s.err != nil {
 			return false
 		}

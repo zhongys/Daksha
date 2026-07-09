@@ -1,4 +1,4 @@
-package requestconfig
+package openai
 
 import (
 	"bytes"
@@ -9,14 +9,10 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
-	"runtime"
-	"strconv"
 	"strings"
 	"time"
 
-	"github.com/tidwall/gjson"
-
-	"github.com/zhongys/Daksha.git/internal/ai/sdk/apierror"
+	"github.com/zhongys/Daksha/internal/ai"
 )
 
 func getDefaultHeaders() map[string]string {
@@ -24,6 +20,7 @@ func getDefaultHeaders() map[string]string {
 		"User-Agent": fmt.Sprintf("daksha/Go %s", "1.0"),
 	}
 }
+
 func encodePathParam(value string) string {
 	switch value {
 	case ".":
@@ -32,53 +29,6 @@ func encodePathParam(value string) string {
 		return "%2E%2E"
 	}
 	return url.PathEscape(value)
-}
-
-func getNormalizedOS() string {
-	switch runtime.GOOS {
-	case "ios":
-		return "iOS"
-	case "android":
-		return "Android"
-	case "darwin":
-		return "MacOS"
-	case "windows":
-		return "Windows"
-	case "freebsd":
-		return "FreeBSD"
-	case "openbsd":
-		return "OpenBSD"
-	case "linux":
-		return "Linux"
-	default:
-		return fmt.Sprintf("Other:%s", runtime.GOOS)
-	}
-}
-
-func getNormalizedArchitecture() string {
-	switch runtime.GOARCH {
-	case "386":
-		return "x32"
-	case "amd64":
-		return "x64"
-	case "arm":
-		return "arm"
-	case "arm64":
-		return "arm64"
-	default:
-		return fmt.Sprintf("other:%s", runtime.GOARCH)
-	}
-}
-
-func getPlatformProperties() map[string]string {
-	return map[string]string{
-		"X-Stainless-Lang":            "go",
-		"X-Stainless-Package-Version": "1.0",
-		"X-Stainless-OS":              getNormalizedOS(),
-		"X-Stainless-Arch":            getNormalizedArchitecture(),
-		"X-Stainless-Runtime":         "go",
-		"X-Stainless-Runtime-Version": runtime.Version(),
-	}
 }
 
 type RequestOption interface {
@@ -105,19 +55,6 @@ func NewRequestConfig(ctx context.Context, method string, u string, body any, ds
 		reader = bytes.NewBuffer(content)
 		hasSerializationFunc = true
 	}
-	// if body, ok := body.(apiform.Marshaler); ok {
-	// 	var (
-	// 		content []byte
-	// 		err     error
-	// 	)
-	// 	content, contentType, err = body.MarshalMultipart()
-	// 	if err != nil {
-	// 		return nil, err
-	// 	}
-	// 	reader = bytes.NewBuffer(content)
-	// 	hasSerializationFunc = true
-	// }
-
 	if body, ok := body.([]byte); ok {
 		reader = bytes.NewBuffer(body)
 		hasSerializationFunc = true
@@ -148,15 +85,10 @@ func NewRequestConfig(ctx context.Context, method string, u string, body any, ds
 	}
 
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("X-Stainless-Retry-Count", "0")
-	req.Header.Set("X-Stainless-Timeout", "0")
 	for k, v := range getDefaultHeaders() {
 		req.Header.Add(k, v)
 	}
 
-	for k, v := range getPlatformProperties() {
-		req.Header.Add(k, v)
-	}
 	cfg := RequestConfig{
 		Context:    ctx,
 		Request:    req,
@@ -174,17 +106,6 @@ func NewRequestConfig(ctx context.Context, method string, u string, body any, ds
 
 	// This must run after `cfg.Apply(...)` above so we know which specific security scheme to add
 	ApplySecurity(cfg)
-
-	// This must run after `cfg.Apply(...)` above in case the request timeout gets modified. We also only
-	// apply our own logic for it if it's still "0" from above. If it's not, then it was deleted or modified
-	// by the user and we should respect that.
-	if req.Header.Get("X-Stainless-Timeout") == "0" {
-		if cfg.RequestTimeout == time.Duration(0) {
-			req.Header.Del("X-Stainless-Timeout")
-		} else {
-			req.Header.Set("X-Stainless-Timeout", strconv.Itoa(int(cfg.RequestTimeout.Seconds())))
-		}
-	}
 
 	return &cfg, nil
 }
@@ -205,25 +126,16 @@ type RequestConfig struct {
 	HTTPClient         *http.Client
 	APIKey             string
 	authHeaderOverride bool
-	authPreference     authCredentialPreference
 	// Configure which security scheme(s) should be enabled for this request
 	Security Security
 	// If ResponseBodyInto not nil, then we will attempt to deserialize into
 	// ResponseBodyInto. If Destination is a []byte, then it will return the body as
 	// is.
 	ResponseBodyInto any
-	// ResponseInto copies the \*http.Response of the corresponding request into the
+	// ResponseInto copies the *http.Response of the corresponding request into the
 	// given address
 	ResponseInto **http.Response
 	Body         io.Reader
-}
-
-func isBeforeContextDeadline(t time.Time, ctx context.Context) bool {
-	d, ok := ctx.Deadline()
-	if !ok {
-		return true
-	}
-	return t.Before(d)
 }
 
 func (cfg *RequestConfig) Execute() (err error) {
@@ -268,10 +180,15 @@ func (cfg *RequestConfig) Execute() (err error) {
 		handler = cfg.CustomHTTPDoer.Do
 	}
 
-	var res *http.Response
 	ctx := cfg.Request.Context()
+	if cfg.RequestTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, cfg.RequestTimeout)
+		defer cancel()
+	}
 	req := cfg.Request.Clone(ctx)
 
+	var res *http.Response
 	res, err = handler(req)
 	if ctx != nil && ctx.Err() != nil {
 		return ctx.Err()
@@ -300,25 +217,17 @@ func (cfg *RequestConfig) Execute() (err error) {
 			return err
 		}
 
-		// If there is an APIError, re-populate the response body so that debugging
-		// utilities can conveniently dump the response without issue.
+		// Re-populate the response body so that debugging utilities can
+		// conveniently dump the response without issue.
 		res.Body = io.NopCloser(bytes.NewBuffer(contents))
 
-		// Load the contents into the error format if it is provided.
-		aerr := apierror.Error{Request: cfg.Request, Response: res, StatusCode: res.StatusCode}
-		unwrapped := gjson.GetBytes(contents, "error").Raw
-		err = json.Unmarshal([]byte(unwrapped), &aerr)
-		if err != nil {
-			return err
-		}
-		return &aerr
+		return ai.ParseAPIError(res.StatusCode, contents)
 	}
 
 	_, intoCustomResponseBody := cfg.ResponseBodyInto.(**http.Response)
 	if cfg.ResponseBodyInto == nil || intoCustomResponseBody {
 		// We aren't reading the response body in this scope, but whoever is will need the
 		// cancel func from the context to observe request timeouts.
-		// Put the cancel function in the response body so it can be handled elsewhere.
 		return nil
 	}
 
@@ -381,7 +290,7 @@ func (cfg *RequestConfig) Clone(ctx context.Context) *RequestConfig {
 	if err != nil {
 		return nil
 	}
-	new := &RequestConfig{
+	return &RequestConfig{
 		RequestTimeout:     cfg.RequestTimeout,
 		Context:            ctx,
 		Request:            req,
@@ -389,10 +298,7 @@ func (cfg *RequestConfig) Clone(ctx context.Context) *RequestConfig {
 		HTTPClient:         cfg.HTTPClient,
 		APIKey:             cfg.APIKey,
 		authHeaderOverride: cfg.authHeaderOverride,
-		authPreference:     cfg.authPreference,
 	}
-
-	return new
 }
 
 func (cfg *RequestConfig) SetHeader(key, value string) {
@@ -459,18 +365,13 @@ type Security struct {
 	BearerAuth bool
 }
 
-type authCredentialPreference int
-
-const (
-	authCredentialPreferenceBearer authCredentialPreference = iota
-)
-
 func WithSecurity(security Security) RequestOption {
 	return RequestOptionFunc(func(r *RequestConfig) error {
 		r.Security = security
 		return nil
 	})
 }
+
 func WithBearerAuthSecurity() RequestOption {
 	return RequestOptionFunc(func(r *RequestConfig) error {
 		r.Security = Security{
@@ -479,19 +380,9 @@ func WithBearerAuthSecurity() RequestOption {
 		return nil
 	})
 }
-func WithBearerAuthPreference() RequestOption {
-	return RequestOptionFunc(func(r *RequestConfig) error {
-		r.authPreference = authCredentialPreferenceBearer
-		return nil
-	})
-}
+
 func ApplySecurity(r RequestConfig) {
 	if r.authHeaderOverride {
-		return
-	}
-
-	if r.authPreference == authCredentialPreferenceBearer && r.Security.BearerAuth && r.APIKey != "" {
-		r.Request.Header.Set("authorization", fmt.Sprintf("Bearer %s", r.APIKey))
 		return
 	}
 

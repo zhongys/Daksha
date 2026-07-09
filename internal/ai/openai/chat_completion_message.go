@@ -1,0 +1,413 @@
+package openai
+
+import (
+	"encoding/json"
+	"fmt"
+)
+
+// ChatCompletionMessageParamUnion holds exactly one message variant.
+// Only one field can be non-nil; marshaling an empty union is an error.
+type ChatCompletionMessageParamUnion struct {
+	OfDeveloper *ChatCompletionDeveloperMessageParam `json:"-"`
+	OfSystem    *ChatCompletionSystemMessageParam    `json:"-"`
+	OfUser      *ChatCompletionUserMessageParam      `json:"-"`
+	OfAssistant *ChatCompletionAssistantMessageParam `json:"-"`
+	OfTool      *ChatCompletionToolMessageParam      `json:"-"`
+}
+
+func (u ChatCompletionMessageParamUnion) MarshalJSON() ([]byte, error) {
+	switch {
+	case u.OfDeveloper != nil:
+		return json.Marshal(u.OfDeveloper)
+	case u.OfSystem != nil:
+		return json.Marshal(u.OfSystem)
+	case u.OfUser != nil:
+		return json.Marshal(u.OfUser)
+	case u.OfAssistant != nil:
+		return json.Marshal(u.OfAssistant)
+	case u.OfTool != nil:
+		return json.Marshal(u.OfTool)
+	default:
+		return nil, fmt.Errorf("openai: empty union ChatCompletionMessageParamUnion")
+	}
+}
+
+type ChatCompletionDeveloperMessageParam struct {
+	// The contents of the developer message.
+	Content ChatCompletionDeveloperMessageParamContentUnion `json:"content,omitzero"`
+	// An optional name for the participant.
+	Name *string `json:"name,omitzero"`
+	// The role of the messages author, in this case `developer`.
+	// Defaults to "developer" when left empty.
+	Role string `json:"role"`
+}
+
+func (r ChatCompletionDeveloperMessageParam) MarshalJSON() ([]byte, error) {
+	if r.Role == "" {
+		r.Role = "developer"
+	}
+	type shadow ChatCompletionDeveloperMessageParam
+	return json.Marshal(shadow(r))
+}
+
+type ChatCompletionDeveloperMessageParamContentUnion struct {
+	OfString              *string                              `json:"-"`
+	OfArrayOfContentParts []ChatCompletionContentPartTextParam `json:"-"`
+}
+
+func (u ChatCompletionDeveloperMessageParamContentUnion) MarshalJSON() ([]byte, error) {
+	switch {
+	case u.OfString != nil:
+		return json.Marshal(u.OfString)
+	case u.OfArrayOfContentParts != nil:
+		return json.Marshal(u.OfArrayOfContentParts)
+	default:
+		return nil, fmt.Errorf("openai: empty union ChatCompletionDeveloperMessageParamContentUnion")
+	}
+}
+
+type ChatCompletionSystemMessageParam struct {
+	// The contents of the system message.
+	Content ChatCompletionSystemMessageParamContentUnion `json:"content,omitzero"`
+	// An optional name for the participant.
+	Name *string `json:"name,omitzero"`
+	// The role of the messages author, in this case `system`.
+	// Defaults to "system" when left empty.
+	Role string `json:"role"`
+}
+
+func (r ChatCompletionSystemMessageParam) MarshalJSON() ([]byte, error) {
+	if r.Role == "" {
+		r.Role = "system"
+	}
+	type shadow ChatCompletionSystemMessageParam
+	return json.Marshal(shadow(r))
+}
+
+type ChatCompletionSystemMessageParamContentUnion struct {
+	OfString              *string                              `json:"-"`
+	OfArrayOfContentParts []ChatCompletionContentPartTextParam `json:"-"`
+}
+
+func (u ChatCompletionSystemMessageParamContentUnion) MarshalJSON() ([]byte, error) {
+	switch {
+	case u.OfString != nil:
+		return json.Marshal(u.OfString)
+	case u.OfArrayOfContentParts != nil:
+		return json.Marshal(u.OfArrayOfContentParts)
+	default:
+		return nil, fmt.Errorf("openai: empty union ChatCompletionSystemMessageParamContentUnion")
+	}
+}
+
+type ChatCompletionUserMessageParam struct {
+	// The contents of the user message.
+	Content ChatCompletionUserMessageParamContentUnion `json:"content,omitzero"`
+	// An optional name for the participant.
+	Name *string `json:"name,omitzero"`
+	// The role of the messages author, in this case `user`.
+	// Defaults to "user" when left empty.
+	Role string `json:"role"`
+}
+
+func (r ChatCompletionUserMessageParam) MarshalJSON() ([]byte, error) {
+	if r.Role == "" {
+		r.Role = "user"
+	}
+	type shadow ChatCompletionUserMessageParam
+	return json.Marshal(shadow(r))
+}
+
+type ChatCompletionUserMessageParamContentUnion struct {
+	OfString              *string                               `json:"-"`
+	OfArrayOfContentParts []ChatCompletionContentPartUnionParam `json:"-"`
+}
+
+func (u ChatCompletionUserMessageParamContentUnion) MarshalJSON() ([]byte, error) {
+	switch {
+	case u.OfString != nil:
+		return json.Marshal(u.OfString)
+	case u.OfArrayOfContentParts != nil:
+		return json.Marshal(u.OfArrayOfContentParts)
+	default:
+		return nil, fmt.Errorf("openai: empty union ChatCompletionUserMessageParamContentUnion")
+	}
+}
+
+type ChatCompletionAssistantMessageParam struct {
+	// The contents of the assistant message. Required unless `tool_calls` is
+	// specified.
+	Content ChatCompletionAssistantMessageParamContentUnion `json:"content,omitzero"`
+	// The refusal message by the assistant.
+	Refusal *string `json:"refusal,omitzero"`
+	// An optional name for the participant.
+	Name *string `json:"name,omitzero"`
+	// The tool calls generated by the model, such as function calls.
+	ToolCalls []ChatCompletionMessageToolCallUnionParam `json:"tool_calls,omitzero"`
+	// The role of the messages author, in this case `assistant`.
+	// Defaults to "assistant" when left empty.
+	Role string `json:"role"`
+}
+
+func (r ChatCompletionAssistantMessageParam) MarshalJSON() ([]byte, error) {
+	if r.Role == "" {
+		r.Role = "assistant"
+	}
+	type shadow ChatCompletionAssistantMessageParam
+	return json.Marshal(shadow(r))
+}
+
+type ChatCompletionAssistantMessageParamContentUnion struct {
+	OfString              *string                                                             `json:"-"`
+	OfArrayOfContentParts []ChatCompletionAssistantMessageParamContentArrayOfContentPartUnion `json:"-"`
+}
+
+func (u ChatCompletionAssistantMessageParamContentUnion) MarshalJSON() ([]byte, error) {
+	switch {
+	case u.OfString != nil:
+		return json.Marshal(u.OfString)
+	case u.OfArrayOfContentParts != nil:
+		return json.Marshal(u.OfArrayOfContentParts)
+	default:
+		return nil, fmt.Errorf("openai: empty union ChatCompletionAssistantMessageParamContentUnion")
+	}
+}
+
+type ChatCompletionAssistantMessageParamContentArrayOfContentPartUnion struct {
+	OfText    *ChatCompletionContentPartTextParam    `json:"-"`
+	OfRefusal *ChatCompletionContentPartRefusalParam `json:"-"`
+}
+
+func (u ChatCompletionAssistantMessageParamContentArrayOfContentPartUnion) MarshalJSON() ([]byte, error) {
+	switch {
+	case u.OfText != nil:
+		return json.Marshal(u.OfText)
+	case u.OfRefusal != nil:
+		return json.Marshal(u.OfRefusal)
+	default:
+		return nil, fmt.Errorf("openai: empty union ChatCompletionAssistantMessageParamContentArrayOfContentPartUnion")
+	}
+}
+
+// ChatCompletionMessage is the message generated by the model in a response.
+type ChatCompletionMessage struct {
+	// The contents of the message.
+	Content string `json:"content"`
+	// The chain-of-thought emitted by reasoning models. DeepSeek, Qwen, GLM,
+	// Kimi and vLLM all use this field name.
+	ReasoningContent string `json:"reasoning_content"`
+	// Alternative field name for the chain-of-thought, used by OpenRouter and
+	// newer vLLM versions. Read whichever of the two fields is non-empty.
+	Reasoning string `json:"reasoning"`
+	// The refusal message generated by the model.
+	Refusal string `json:"refusal"`
+	// The role of the author of this message, always "assistant".
+	Role string `json:"role"`
+	// The tool calls generated by the model, such as function calls.
+	ToolCalls []ChatCompletionMessageToolCall `json:"tool_calls"`
+	// Raw is the unmodified message JSON. Provider-specific fields that have
+	// no explicit counterpart above can be unmarshaled from it.
+	Raw json.RawMessage `json:"-"`
+}
+
+func (r *ChatCompletionMessage) UnmarshalJSON(data []byte) error {
+	type shadow ChatCompletionMessage
+	if err := json.Unmarshal(data, (*shadow)(r)); err != nil {
+		return err
+	}
+	r.Raw = append([]byte(nil), data...)
+	return nil
+}
+
+// ToAssistantMessageParam converts a response message into a request param,
+// for appending the assistant turn back onto the conversation.
+//
+// Reasoning content is intentionally dropped: providers reject or ignore
+// reasoning_content sent back as input.
+func (r ChatCompletionMessage) ToAssistantMessageParam() ChatCompletionAssistantMessageParam {
+	p := ChatCompletionAssistantMessageParam{Role: "assistant"}
+
+	// Explicit null is decoded as the empty string; elide it on the way out.
+	if r.Content != "" {
+		p.Content.OfString = String(r.Content)
+	}
+	if r.Refusal != "" {
+		p.Refusal = String(r.Refusal)
+	}
+
+	for _, v := range r.ToolCalls {
+		var u ChatCompletionMessageToolCallUnionParam
+		switch v.Type {
+		case "custom":
+			u.OfCustom = &ChatCompletionMessageCustomToolCallParam{
+				ID:   v.ID,
+				Type: "custom",
+				Custom: ChatCompletionMessageCustomToolCallCustomParam{
+					Input: v.Custom.Input,
+					Name:  v.Custom.Name,
+				},
+			}
+		default:
+			u.OfFunction = &ChatCompletionMessageFunctionToolCallParam{
+				ID:   v.ID,
+				Type: "function",
+				Function: ChatCompletionMessageFunctionToolCallFunctionParam{
+					Arguments: v.Function.Arguments,
+					Name:      v.Function.Name,
+				},
+			}
+		}
+		p.ToolCalls = append(p.ToolCalls, u)
+	}
+	return p
+}
+
+// ChatCompletionMessageToolCall is the flattened superset of the tool call
+// variants. Switch on Type ("function" or "custom") and read the matching
+// field; the other field is left as its zero value.
+type ChatCompletionMessageToolCall struct {
+	// The ID of the tool call.
+	ID string `json:"id"`
+	// Any of "function", "custom".
+	Type string `json:"type"`
+	// Set when Type == "function".
+	Function ChatCompletionMessageToolCallFunction `json:"function"`
+	// Set when Type == "custom".
+	Custom ChatCompletionMessageToolCallCustom `json:"custom"`
+}
+
+type ChatCompletionMessageToolCallFunction struct {
+	// The arguments to call the function with, as generated by the model in JSON
+	// format. Note that the model does not always generate valid JSON; validate
+	// the arguments before calling your function.
+	Arguments string `json:"arguments"`
+	// The name of the function to call.
+	Name string `json:"name"`
+}
+
+type ChatCompletionMessageToolCallCustom struct {
+	// The input for the custom tool call generated by the model.
+	Input string `json:"input"`
+	// The name of the custom tool to call.
+	Name string `json:"name"`
+}
+
+// ChatCompletionMessageToolCallUnionParam holds exactly one tool call variant.
+type ChatCompletionMessageToolCallUnionParam struct {
+	OfFunction *ChatCompletionMessageFunctionToolCallParam `json:"-"`
+	OfCustom   *ChatCompletionMessageCustomToolCallParam   `json:"-"`
+}
+
+func (u ChatCompletionMessageToolCallUnionParam) MarshalJSON() ([]byte, error) {
+	switch {
+	case u.OfFunction != nil:
+		return json.Marshal(u.OfFunction)
+	case u.OfCustom != nil:
+		return json.Marshal(u.OfCustom)
+	default:
+		return nil, fmt.Errorf("openai: empty union ChatCompletionMessageToolCallUnionParam")
+	}
+}
+
+type ChatCompletionMessageFunctionToolCallParam struct {
+	// The ID of the tool call.
+	ID string `json:"id"`
+	// The function that the model called.
+	Function ChatCompletionMessageFunctionToolCallFunctionParam `json:"function"`
+	// The type of the tool. Defaults to "function" when left empty.
+	Type string `json:"type"`
+}
+
+func (r ChatCompletionMessageFunctionToolCallParam) MarshalJSON() ([]byte, error) {
+	if r.Type == "" {
+		r.Type = "function"
+	}
+	type shadow ChatCompletionMessageFunctionToolCallParam
+	return json.Marshal(shadow(r))
+}
+
+type ChatCompletionMessageFunctionToolCallFunctionParam struct {
+	// The arguments to call the function with, in JSON format.
+	Arguments string `json:"arguments"`
+	// The name of the function to call.
+	Name string `json:"name"`
+}
+
+type ChatCompletionMessageCustomToolCallParam struct {
+	// The ID of the tool call.
+	ID string `json:"id"`
+	// The custom tool that the model called.
+	Custom ChatCompletionMessageCustomToolCallCustomParam `json:"custom"`
+	// The type of the tool. Defaults to "custom" when left empty.
+	Type string `json:"type"`
+}
+
+func (r ChatCompletionMessageCustomToolCallParam) MarshalJSON() ([]byte, error) {
+	if r.Type == "" {
+		r.Type = "custom"
+	}
+	type shadow ChatCompletionMessageCustomToolCallParam
+	return json.Marshal(shadow(r))
+}
+
+type ChatCompletionMessageCustomToolCallCustomParam struct {
+	// The input for the custom tool call generated by the model.
+	Input string `json:"input"`
+	// The name of the custom tool to call.
+	Name string `json:"name"`
+}
+
+func DeveloperMessage[T string | []ChatCompletionContentPartTextParam](content T) ChatCompletionMessageParamUnion {
+	developer := ChatCompletionDeveloperMessageParam{Role: "developer"}
+	switch v := any(content).(type) {
+	case string:
+		developer.Content.OfString = String(v)
+	case []ChatCompletionContentPartTextParam:
+		developer.Content.OfArrayOfContentParts = v
+	}
+	return ChatCompletionMessageParamUnion{OfDeveloper: &developer}
+}
+
+func SystemMessage[T string | []ChatCompletionContentPartTextParam](content T) ChatCompletionMessageParamUnion {
+	system := ChatCompletionSystemMessageParam{Role: "system"}
+	switch v := any(content).(type) {
+	case string:
+		system.Content.OfString = String(v)
+	case []ChatCompletionContentPartTextParam:
+		system.Content.OfArrayOfContentParts = v
+	}
+	return ChatCompletionMessageParamUnion{OfSystem: &system}
+}
+
+func UserMessage[T string | []ChatCompletionContentPartUnionParam](content T) ChatCompletionMessageParamUnion {
+	user := ChatCompletionUserMessageParam{Role: "user"}
+	switch v := any(content).(type) {
+	case string:
+		user.Content.OfString = String(v)
+	case []ChatCompletionContentPartUnionParam:
+		user.Content.OfArrayOfContentParts = v
+	}
+	return ChatCompletionMessageParamUnion{OfUser: &user}
+}
+
+func AssistantMessage[T string | []ChatCompletionAssistantMessageParamContentArrayOfContentPartUnion](content T) ChatCompletionMessageParamUnion {
+	assistant := ChatCompletionAssistantMessageParam{Role: "assistant"}
+	switch v := any(content).(type) {
+	case string:
+		assistant.Content.OfString = String(v)
+	case []ChatCompletionAssistantMessageParamContentArrayOfContentPartUnion:
+		assistant.Content.OfArrayOfContentParts = v
+	}
+	return ChatCompletionMessageParamUnion{OfAssistant: &assistant}
+}
+
+func ToolMessage[T string | []ChatCompletionContentPartTextParam](content T, toolCallID string) ChatCompletionMessageParamUnion {
+	tool := ChatCompletionToolMessageParam{Role: "tool", ToolCallID: toolCallID}
+	switch v := any(content).(type) {
+	case string:
+		tool.Content.OfString = String(v)
+	case []ChatCompletionContentPartTextParam:
+		tool.Content.OfArrayOfContentParts = v
+	}
+	return ChatCompletionMessageParamUnion{OfTool: &tool}
+}

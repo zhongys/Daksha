@@ -1,4 +1,4 @@
-package requestconfig
+package openai
 
 import (
 	"context"
