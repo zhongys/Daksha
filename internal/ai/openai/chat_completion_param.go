@@ -113,20 +113,20 @@ type ResponseFormatJSONSchemaJSONSchemaParam struct {
 
 func ResponseFormatText() ChatCompletionNewParamsResponseFormatUnion {
 	return ChatCompletionNewParamsResponseFormatUnion{
-		OfText: &ResponseFormatTextParam{Type: ResponseFormatTypeText},
+		OfText: &ResponseFormatTextParam{Type: "text"},
 	}
 }
 
 func ResponseFormatJSONObject() ChatCompletionNewParamsResponseFormatUnion {
 	return ChatCompletionNewParamsResponseFormatUnion{
-		OfJSONObject: &ResponseFormatJSONObjectParam{Type: ResponseFormatTypeJSONObject},
+		OfJSONObject: &ResponseFormatJSONObjectParam{Type: "json_object"},
 	}
 }
 
 func ResponseFormatJSONSchema(schema ResponseFormatJSONSchemaJSONSchemaParam) ChatCompletionNewParamsResponseFormatUnion {
 	return ChatCompletionNewParamsResponseFormatUnion{
 		OfJSONSchema: &ResponseFormatJSONSchemaParam{
-			Type:       ResponseFormatTypeJSONSchema,
+			Type:       "json_schema",
 			JSONSchema: schema,
 		},
 	}

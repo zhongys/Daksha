@@ -29,7 +29,7 @@ func (u ChatCompletionContentPartUnionParam) MarshalJSON() ([]byte, error) {
 func TextContentPart(text string) ChatCompletionContentPartUnionParam {
 	return ChatCompletionContentPartUnionParam{
 		OfText: &ChatCompletionContentPartTextParam{
-			Type: ContentTypeText,
+			Type: "text",
 			Text: text,
 		},
 	}
@@ -38,7 +38,7 @@ func TextContentPart(text string) ChatCompletionContentPartUnionParam {
 func ImageContentPart(imageURL ChatCompletionContentPartImageImageURLParam) ChatCompletionContentPartUnionParam {
 	return ChatCompletionContentPartUnionParam{
 		OfImageURL: &ChatCompletionContentPartImageParam{
-			Type:     ContentTypeImageURL,
+			Type:     "image_url",
 			ImageURL: imageURL,
 		},
 	}
@@ -47,7 +47,7 @@ func ImageContentPart(imageURL ChatCompletionContentPartImageImageURLParam) Chat
 func FileContentPart(file ChatCompletionContentPartFileFileParam) ChatCompletionContentPartUnionParam {
 	return ChatCompletionContentPartUnionParam{
 		OfFile: &ChatCompletionContentPartFileParam{
-			Type: ContentTypeFile,
+			Type: "file",
 			File: file,
 		},
 	}
@@ -62,7 +62,7 @@ type ChatCompletionContentPartTextParam struct {
 
 func (r ChatCompletionContentPartTextParam) MarshalJSON() ([]byte, error) {
 	if r.Type == "" {
-		r.Type = ContentTypeText
+		r.Type = "text"
 	}
 	type shadow ChatCompletionContentPartTextParam
 	return json.Marshal(shadow(r))
@@ -76,7 +76,7 @@ type ChatCompletionContentPartImageParam struct {
 
 func (r ChatCompletionContentPartImageParam) MarshalJSON() ([]byte, error) {
 	if r.Type == "" {
-		r.Type = ContentTypeImageURL
+		r.Type = "image_url"
 	}
 	type shadow ChatCompletionContentPartImageParam
 	return json.Marshal(shadow(r))
@@ -99,7 +99,7 @@ type ChatCompletionContentPartFileParam struct {
 
 func (r ChatCompletionContentPartFileParam) MarshalJSON() ([]byte, error) {
 	if r.Type == "" {
-		r.Type = ContentTypeFile
+		r.Type = "file"
 	}
 	type shadow ChatCompletionContentPartFileParam
 	return json.Marshal(shadow(r))
@@ -124,7 +124,7 @@ type ChatCompletionContentPartRefusalParam struct {
 
 func (r ChatCompletionContentPartRefusalParam) MarshalJSON() ([]byte, error) {
 	if r.Type == "" {
-		r.Type = ContentTypeRefusal
+		r.Type = "refusal"
 	}
 	type shadow ChatCompletionContentPartRefusalParam
 	return json.Marshal(shadow(r))
