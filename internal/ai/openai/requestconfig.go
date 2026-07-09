@@ -11,8 +11,6 @@ import (
 	"net/url"
 	"strings"
 	"time"
-
-	"github.com/zhongys/Daksha/internal/ai"
 )
 
 func getDefaultHeaders() map[string]string {
@@ -221,7 +219,7 @@ func (cfg *RequestConfig) Execute() (err error) {
 		// conveniently dump the response without issue.
 		res.Body = io.NopCloser(bytes.NewBuffer(contents))
 
-		return ai.ParseAPIError(res.StatusCode, contents)
+		return ParseAPIError(res.StatusCode, contents)
 	}
 
 	_, intoCustomResponseBody := cfg.ResponseBodyInto.(**http.Response)

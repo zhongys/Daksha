@@ -1,4 +1,4 @@
-package ai
+package openai
 
 import (
 	"encoding/json"
@@ -6,8 +6,8 @@ import (
 	"net/http"
 )
 
-// APIError is the provider-neutral error returned when an OpenAI-compatible
-// endpoint responds with a non-2xx status, or emits an error event mid-stream.
+// APIError is returned when an OpenAI-compatible endpoint responds with a
+// non-2xx status, or emits an error event mid-stream.
 type APIError struct {
 	// StatusCode is zero for errors that did not come from an HTTP response,
 	// e.g. errors embedded in a streaming event.
@@ -41,10 +41,10 @@ func ParseAPIError(statusCode int, body []byte) *APIError {
 	return apiErr
 }
 
-// ErrorFromEventData inspects a streaming event payload for an error envelope.
-// It returns nil when the payload carries no error. Any non-null "error" key
-// counts as an error, even if it lacks the standard message/type fields.
-func ErrorFromEventData(data []byte) *APIError {
+// errorFromEventData inspects a streaming event payload for an error
+// envelope. It returns nil when the payload carries no error. Any non-null
+// "error" key counts as an error, even without standard message/type fields.
+func errorFromEventData(data []byte) *APIError {
 	var probe struct {
 		Error json.RawMessage `json:"error"`
 	}

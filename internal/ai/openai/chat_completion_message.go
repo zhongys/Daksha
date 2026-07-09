@@ -147,6 +147,9 @@ type ChatCompletionAssistantMessageParam struct {
 	// The role of the messages author, in this case `assistant`.
 	// Defaults to "assistant" when left empty.
 	Role string `json:"role"`
+	// ExtraFields carries non-standard fields merged into the message JSON,
+	// e.g. reasoning_content replayed to endpoints that require it.
+	ExtraFields map[string]any `json:"-"`
 }
 
 func (r ChatCompletionAssistantMessageParam) MarshalJSON() ([]byte, error) {
@@ -154,7 +157,23 @@ func (r ChatCompletionAssistantMessageParam) MarshalJSON() ([]byte, error) {
 		r.Role = "assistant"
 	}
 	type shadow ChatCompletionAssistantMessageParam
-	return json.Marshal(shadow(r))
+	b, err := json.Marshal(shadow(r))
+	if err != nil || len(r.ExtraFields) == 0 {
+		return b, err
+	}
+
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(b, &m); err != nil {
+		return nil, err
+	}
+	for k, v := range r.ExtraFields {
+		raw, err := json.Marshal(v)
+		if err != nil {
+			return nil, fmt.Errorf("openai: marshal extra field %q: %w", k, err)
+		}
+		m[k] = raw
+	}
+	return json.Marshal(m)
 }
 
 type ChatCompletionAssistantMessageParamContentUnion struct {

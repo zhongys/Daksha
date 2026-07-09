@@ -3,8 +3,8 @@ package ai
 // Provider describes an OpenAI-compatible endpoint. Vendors that speak the
 // same wire protocol differ only in configuration, so a provider is data,
 // not code: adding a vendor means adding an entry here. Only a genuinely
-// different wire protocol (e.g. Anthropic Messages) warrants a new protocol
-// package next to ai/openai.
+// different wire protocol (e.g. Anthropic Messages) warrants a new adapter
+// package next to ai/api/openaicompletions.
 type Provider struct {
 	Name    string
 	BaseURL string

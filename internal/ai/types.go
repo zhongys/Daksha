@@ -131,6 +131,17 @@ type ToolResultMessage[T any] struct {
 	Timestamp  int64               `json:"timestamp"`
 }
 
+// ToolResult gives protocol adapters generic-free access to any
+// ToolResultMessage[T] instantiation.
+type ToolResult interface {
+	Message
+	ToolResultData() (toolCallID, toolName string, content []ToolResultContent, isError bool)
+}
+
+func (m *ToolResultMessage[T]) ToolResultData() (string, string, []ToolResultContent, bool) {
+	return m.ToolCallId, m.ToolName, m.Content, m.IsError
+}
+
 type AssistantMessageEventType string
 
 const (
@@ -175,11 +186,49 @@ func (TextDeltaEvent) EventType() AssistantMessageEventType { return AssistantEv
 
 type TextEndEvent struct {
 	ContentIndex int
-	content      string
+	Content      string
 	Partial      AssistantMessage
 }
 
 func (TextEndEvent) EventType() AssistantMessageEventType { return AssistantEventTextEnd }
+
+type ThinkingStartEvent struct {
+	ContentIndex int
+	Partial      AssistantMessage
+}
+
+func (ThinkingStartEvent) EventType() AssistantMessageEventType { return AssistantEventThinkingStart }
+
+type ThinkingDeltaEvent struct {
+	ContentIndex int
+	Delta        string
+	Partial      AssistantMessage
+}
+
+func (ThinkingDeltaEvent) EventType() AssistantMessageEventType { return AssistantEventThinkingDelta }
+
+type ThinkingEndEvent struct {
+	ContentIndex int
+	Content      string
+	Partial      AssistantMessage
+}
+
+func (ThinkingEndEvent) EventType() AssistantMessageEventType { return AssistantEventThinkingEnd }
+
+type ToolCallStartEvent struct {
+	ContentIndex int
+	Partial      AssistantMessage
+}
+
+func (ToolCallStartEvent) EventType() AssistantMessageEventType { return AssistantEventToolCallStart }
+
+type ToolCallDeltaEvent struct {
+	ContentIndex int
+	Delta        string
+	Partial      AssistantMessage
+}
+
+func (ToolCallDeltaEvent) EventType() AssistantMessageEventType { return AssistantEventToolCallDelta }
 
 type ToolCallEndEvent struct {
 	ContentIndex int

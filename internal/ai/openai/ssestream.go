@@ -7,8 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-
-	"github.com/zhongys/Daksha/internal/ai"
 )
 
 type Decoder interface {
@@ -158,7 +156,7 @@ func (s *Stream[T]) Next() bool {
 			continue
 		}
 
-		if apiErr := ai.ErrorFromEventData(s.decoder.Event().Data); apiErr != nil {
+		if apiErr := errorFromEventData(s.decoder.Event().Data); apiErr != nil {
 			s.err = &StreamError{
 				Message: fmt.Sprintf("received error while streaming: %s", apiErr.Message),
 				Event:   s.decoder.Event(),

@@ -1,8 +1,9 @@
 package openai
 
 // Client is the entry point for the OpenAI-compatible wire protocol.
-// Vendor differences (base URL, API key, extra request fields) come in
-// through RequestOptions built from an ai.Provider.
+// This package is a self-contained SDK for the protocol (the equivalent of
+// the official openai client): it knows nothing about the neutral ai layer.
+// Vendor differences come in through RequestOptions.
 type Client struct {
 	Options []RequestOption
 	Chat    ChatService
