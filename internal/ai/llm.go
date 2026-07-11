@@ -34,19 +34,39 @@ type OpenAICompat struct {
 	RequiresReasoningContentOnAssistantMessages *bool
 }
 
-// Model identifies a concrete model on a provider, plus its capabilities.
+// Model identifies a concrete model on a provider, plus its capabilities and
+// pricing. Models are data, not code: the backing catalog (a database, for a
+// backend) is loaded into a Client's registry at runtime.
 type Model struct {
 	// Provider is the key of the owning Provider entry.
 	Provider string
 	// ID is the wire model name, e.g. "deepseek-reasoner".
 	ID string
+
+	// Capability switches. Zero values are conservative: an unset capability
+	// means the model does not have it.
+	//
 	// Reasoning marks models that can emit chain-of-thought; thinking format
-	// parameters are only sent for these.
-	Reasoning bool
+	// parameters are only sent for these (a tuning knob — silently dropped
+	// otherwise). The remaining switches gate semantic content and are
+	// enforced loudly by Client.Stream before dispatch.
+	Reasoning  bool
+	ToolCall   bool
+	ImageInput bool
+	AudioInput bool
+	VideoInput bool
+
+	// Pricing is the per-token price in nano-yuan; zero means free/unknown
+	// and yields a zero Cost.
+	Pricing Pricing
+	// ContextWindow and MaxOutputTokens inform the agent layer's budgeting.
+	// They never alter requests: an unset StreamOptions.MaxTokens stays
+	// unset and the vendor default applies.
+	ContextWindow   int64
+	MaxOutputTokens int64
+
 	// Extra carries model-level request fields merged into every request.
 	Extra map[string]any
-	// Compat overrides endpoint quirk detection.
-	Compat *OpenAICompat
 }
 
 type ToolDefinition struct {
@@ -80,13 +100,23 @@ type StreamOptions struct {
 
 // Streamer is the protocol-neutral entry point for one LLM turn.
 //
+// Implementations are stateless protocol translators: one instance per wire
+// protocol serves every endpoint speaking it. The provider snapshot passed to
+// each call carries all endpoint configuration (base URL, resolved API key,
+// quirk overrides), so registry changes take effect on the next call while
+// in-flight requests finish on the snapshot they started with.
+//
 // Contract (mirrors pi-ai's StreamFunction): the call itself never fails.
 // Request, transport and parse failures are encoded in the returned stream —
 // an ErrorEvent followed by completion with a final AssistantMessage whose
 // StopReason is StopReasonError or StopReasonAborted and whose ErrorMessage
 // is set. Consumers must drain Events() until closed; Result() then returns
 // the final message.
+//
+// Adapters must accept this neutral StreamOptions as-is; inventing
+// adapter-specific option types is forbidden (it is why pi needed a separate
+// streamSimple layer, which this design deliberately makes impossible).
 type Streamer interface {
-	Stream(ctx context.Context, model Model, prompt Prompt, opts StreamOptions,
+	Stream(ctx context.Context, provider Provider, model Model, prompt Prompt, opts StreamOptions,
 	) *EventStream[AssistantMessageEvent, *AssistantMessage]
 }

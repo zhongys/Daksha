@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"os"
 	"strings"
 	"time"
 
@@ -15,45 +14,36 @@ import (
 const apiName = "openai-completions"
 
 // Streamer implements ai.Streamer over the OpenAI-compatible completions
-// protocol. One Streamer serves one provider endpoint.
+// protocol. It is a stateless protocol translator: one instance serves every
+// endpoint speaking this protocol, and each Stream call carries the provider
+// snapshot (base URL, resolved API key, quirk overrides) it should use.
 type Streamer struct {
-	provider    ai.Provider
 	completions openai.ChatCompletionService
 }
 
 var _ ai.Streamer = (*Streamer)(nil)
 
-// NewStreamer builds a Streamer for a provider. The API key is read from the
-// provider's APIKeyEnv environment variable; pass openai.WithAPIKey to override.
-func NewStreamer(provider ai.Provider, opts ...openai.RequestOption) *Streamer {
-	var base []openai.RequestOption
-	if provider.BaseURL != "" {
-		base = append(base, openai.WithBaseURL(provider.BaseURL))
-	}
-	if provider.APIKeyEnv != "" {
-		if key := os.Getenv(provider.APIKeyEnv); key != "" {
-			base = append(base, openai.WithAPIKey(key))
-		}
-	}
-	base = append(base, opts...)
+// NewStreamer builds the protocol adapter. Options carry infrastructure
+// configuration only (shared http client, timeouts); per-endpoint business
+// configuration travels with each Stream call's provider.
+func NewStreamer(opts ...openai.RequestOption) *Streamer {
 	return &Streamer{
-		provider:    provider,
-		completions: openai.NewChatCompletionService(base...),
+		completions: openai.NewChatCompletionService(opts...),
 	}
 }
 
 // Stream never fails synchronously: request and transport errors are
 // delivered as an ErrorEvent plus a final message with StopReason
 // error/aborted, per the ai.Streamer contract.
-func (s *Streamer) Stream(ctx context.Context, model ai.Model, prompt ai.Prompt, opts ai.StreamOptions,
+func (s *Streamer) Stream(ctx context.Context, provider ai.Provider, model ai.Model, prompt ai.Prompt, opts ai.StreamOptions,
 ) *ai.EventStream[ai.AssistantMessageEvent, *ai.AssistantMessage] {
 	stream, producer := ai.NewEventStream[ai.AssistantMessageEvent, *ai.AssistantMessage](ctx, 64)
-	go s.run(ctx, producer, model, prompt, opts)
+	go s.run(ctx, producer, provider, model, prompt, opts)
 	return stream
 }
 
 func (s *Streamer) run(ctx context.Context, producer *ai.Producer[ai.AssistantMessageEvent, *ai.AssistantMessage],
-	model ai.Model, prompt ai.Prompt, opts ai.StreamOptions) {
+	provider ai.Provider, model ai.Model, prompt ai.Prompt, opts ai.StreamOptions) {
 
 	msg := &ai.AssistantMessage{
 		Role:       ai.RoleAssistant,
@@ -64,16 +54,24 @@ func (s *Streamer) run(ctx context.Context, producer *ai.Producer[ai.AssistantMe
 		Timestamp:  time.Now().UnixMilli(),
 	}
 	if msg.Provider == "" {
-		msg.Provider = s.provider.Name
+		msg.Provider = provider.Name
 	}
 
-	params, err := buildParams(s.provider, model, prompt, opts)
+	params, err := buildParams(provider, model, prompt, opts)
 	if err != nil {
 		fail(ctx, producer, msg, err)
 		return
 	}
 
-	sse := s.completions.NewStreaming(ctx, params)
+	var reqOpts []openai.RequestOption
+	if provider.BaseURL != "" {
+		reqOpts = append(reqOpts, openai.WithBaseURL(provider.BaseURL))
+	}
+	if provider.APIKey != "" {
+		reqOpts = append(reqOpts, openai.WithAPIKey(provider.APIKey))
+	}
+
+	sse := s.completions.NewStreaming(ctx, params, reqOpts...)
 	defer sse.Close()
 	if err := sse.Err(); err != nil {
 		fail(ctx, producer, msg, err)
@@ -98,7 +96,7 @@ func (s *Streamer) run(ctx context.Context, producer *ai.Producer[ai.AssistantMe
 			msg.ResponseModel = chunk.Model
 		}
 		if usageIsSet(chunk.Usage) {
-			msg.Usage = convertUsage(chunk.Usage)
+			msg.Usage = convertUsage(chunk.Usage, model)
 		}
 
 		if len(chunk.Choices) == 0 {
@@ -108,7 +106,7 @@ func (s *Streamer) run(ctx context.Context, producer *ai.Producer[ai.AssistantMe
 
 		// Some providers (e.g. Moonshot) report usage on the choice.
 		if !usageIsSet(chunk.Usage) && usageIsSet(choice.Usage) {
-			msg.Usage = convertUsage(choice.Usage)
+			msg.Usage = convertUsage(choice.Usage, model)
 		}
 
 		if choice.FinishReason != "" {
@@ -331,10 +329,10 @@ func usageIsSet(u openai.CompletionUsage) bool {
 	return u.PromptTokens != 0 || u.CompletionTokens != 0 || u.TotalTokens != 0
 }
 
-// convertUsage maps wire usage to neutral usage. Cached tokens are carved
-// out of input because they are billed differently: input covers only
-// uncached prompt tokens.
-func convertUsage(u openai.CompletionUsage) ai.Usage {
+// convertUsage maps wire usage to neutral usage and prices it against the
+// model's per-token pricing. Cached tokens are carved out of input because
+// they are billed differently: input covers only uncached prompt tokens.
+func convertUsage(u openai.CompletionUsage, model ai.Model) ai.Usage {
 	cacheRead := u.PromptTokensDetails.CachedTokens
 	var cacheWrite int64
 	if len(u.Raw) > 0 {
@@ -356,7 +354,7 @@ func convertUsage(u openai.CompletionUsage) ai.Usage {
 	if input < 0 {
 		input = 0
 	}
-	return ai.Usage{
+	usage := ai.Usage{
 		Input:       input,
 		Output:      u.CompletionTokens,
 		CacheRead:   cacheRead,
@@ -364,6 +362,8 @@ func convertUsage(u openai.CompletionUsage) ai.Usage {
 		Reasoning:   u.CompletionTokensDetails.ReasoningTokens,
 		TotalTokens: input + u.CompletionTokens + cacheRead + cacheWrite,
 	}
+	usage.Cost = ai.CalculateCost(model, usage)
+	return usage
 }
 
 func mapStopReason(reason string) (ai.StopReason, string) {

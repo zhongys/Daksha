@@ -1,5 +1,7 @@
 package ai
 
+import "fmt"
+
 type Role string
 
 const (
@@ -13,6 +15,8 @@ type ContentType string
 const (
 	ContentTypeText     ContentType = "text"
 	ContentTypeImage    ContentType = "image"
+	ContentTypeAudio    ContentType = "audio"
+	ContentTypeVideo    ContentType = "video"
 	ContentTypeThinking ContentType = "thinking"
 	ContentTypeToolCall ContentType = "toolCall"
 )
@@ -27,6 +31,9 @@ const (
 	StopReasonAborted StopReason = "aborted"
 )
 
+// Cost is the derived price of one turn in nano-yuan (10⁻⁹ CNY).
+// Tokens times per-token pricing is the source of truth for billing; Cost is
+// computed from them with pure integer arithmetic and is always reproducible.
 type Cost struct {
 	Input      int64 `json:"input"`
 	Output     int64 `json:"output"`
@@ -62,6 +69,8 @@ func (*TextContent) isAssistantContent()     {}
 func (*TextContent) isToolResultContent()    {}
 func (*ImageContent) isUserContent()         {}
 func (*ImageContent) isToolResultContent()   {}
+func (*AudioContent) isUserContent()         {}
+func (*VideoContent) isUserContent()         {}
 func (*ThinkingContent) isAssistantContent() {}
 func (*ToolCallContent) isAssistantContent() {}
 
@@ -71,10 +80,66 @@ type TextContent struct {
 	TextSignature string      `json:"textSignature,omitempty"`
 }
 
+// Media content blocks carry their payload either inline (Data, base64, with
+// MimeType) or by reference (URL) — exactly one of the two forms must be set.
+// Adapters reject the empty and the double-set case, and fail loudly when the
+// target endpoint cannot accept the given form; the ai layer never downloads
+// or transcodes media.
+
 type ImageContent struct {
-	Type     ContentType `json:"type"`
-	Data     string      `json:"data"`
-	MimeType string      `json:"mimeType"`
+	Type ContentType `json:"type"`
+	// Data is the inline base64 payload; mutually exclusive with URL.
+	Data string `json:"data,omitempty"`
+	// MimeType is required when Data is set.
+	MimeType string `json:"mimeType,omitempty"`
+	// URL is the by-reference form, passed through to the provider verbatim.
+	URL string `json:"url,omitempty"`
+}
+
+type AudioContent struct {
+	Type ContentType `json:"type"`
+	// Data is the inline base64 payload; mutually exclusive with URL.
+	Data string `json:"data,omitempty"`
+	// MimeType is required when Data is set.
+	MimeType string `json:"mimeType,omitempty"`
+	// URL is the by-reference form, passed through to the provider verbatim.
+	URL string `json:"url,omitempty"`
+}
+
+type VideoContent struct {
+	Type ContentType `json:"type"`
+	// Data is the inline base64 payload; mutually exclusive with URL.
+	Data string `json:"data,omitempty"`
+	// MimeType is required when Data is set.
+	MimeType string `json:"mimeType,omitempty"`
+	// URL is the by-reference form, passed through to the provider verbatim.
+	URL string `json:"url,omitempty"`
+}
+
+// ValidateMedia enforces the media union rule: exactly one of Data and URL,
+// and a MimeType alongside Data.
+func ValidateMedia(kind ContentType, data, mimeType, url string) error {
+	switch {
+	case data == "" && url == "":
+		return fmt.Errorf("ai: %s content has neither data nor url", kind)
+	case data != "" && url != "":
+		return fmt.Errorf("ai: %s content has both data and url", kind)
+	case data != "" && mimeType == "":
+		return fmt.Errorf("ai: %s content has inline data without mimeType", kind)
+	}
+	return nil
+}
+
+func (c *ImageContent) Validate() error {
+	return ValidateMedia(ContentTypeImage, c.Data, c.MimeType, c.URL)
+}
+
+func (c *AudioContent) Validate() error {
+	return ValidateMedia(ContentTypeAudio, c.Data, c.MimeType, c.URL)
+}
+
+func (c *VideoContent) Validate() error {
+	return ValidateMedia(ContentTypeVideo, c.Data, c.MimeType, c.URL)
 }
 
 type ThinkingContent struct {

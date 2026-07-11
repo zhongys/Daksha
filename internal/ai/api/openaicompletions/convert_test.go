@@ -78,14 +78,14 @@ func TestBuildParamsThinkingFormats(t *testing.T) {
 			notWant:  []string{"thinking", "reasoning_effort", "enable_thinking"},
 		},
 		{
-			name:     "compat override wins over detection",
-			provider: ai.Provider{Name: "custom", BaseURL: "https://my-vllm.internal/v1/"},
-			model: ai.Model{
-				Provider: "custom", ID: "m", Reasoning: true,
+			name: "compat override wins over detection",
+			provider: ai.Provider{
+				Name: "custom", BaseURL: "https://my-vllm.internal/v1/",
 				Compat: &ai.OpenAICompat{ThinkingFormat: ai.ThinkingFormatQwen},
 			},
-			opts: ai.StreamOptions{ReasoningEffort: "low"},
-			want: []string{`"enable_thinking":true`},
+			model: ai.Model{Provider: "custom", ID: "m", Reasoning: true},
+			opts:  ai.StreamOptions{ReasoningEffort: "low"},
+			want:  []string{`"enable_thinking":true`},
 		},
 	}
 
@@ -267,7 +267,10 @@ func TestConvertToolResultPlaceholders(t *testing.T) {
 			&ai.ImageContent{Type: ai.ContentTypeImage, Data: "AAAA", MimeType: "image/png"},
 		},
 	}
-	msg, imgs := convertToolResult(tr)
+	msg, imgs, err := convertToolResult(tr)
+	if err != nil {
+		t.Fatalf("convertToolResult: %v", err)
+	}
 	if got := *msg.OfTool.Content.OfString; got != "(see attached image)" {
 		t.Errorf("placeholder = %q", got)
 	}
@@ -276,7 +279,10 @@ func TestConvertToolResultPlaceholders(t *testing.T) {
 	}
 
 	empty := &ai.ToolResultMessage[struct{}]{Role: ai.RoleToolResult, ToolCallId: "c2"}
-	msg, _ = convertToolResult(empty)
+	msg, _, err = convertToolResult(empty)
+	if err != nil {
+		t.Fatalf("convertToolResult: %v", err)
+	}
 	if got := *msg.OfTool.Content.OfString; got != "(no tool output)" {
 		t.Errorf("placeholder = %q", got)
 	}
@@ -285,15 +291,54 @@ func TestConvertToolResultPlaceholders(t *testing.T) {
 func TestConvertUserMessageImageURL(t *testing.T) {
 	m := &ai.UserMessage{Role: ai.RoleUser, Content: []ai.UserContent{
 		&ai.TextContent{Type: ai.ContentTypeText, Text: "look"},
-		&ai.ImageContent{Type: ai.ContentTypeImage, Data: "https://x/1.png", MimeType: "image/png"},
+		&ai.ImageContent{Type: ai.ContentTypeImage, URL: "https://x/1.png"},
 	}}
-	p, ok := convertUserMessage(m)
+	p, ok, err := convertUserMessage(m)
+	if err != nil {
+		t.Fatalf("convertUserMessage: %v", err)
+	}
 	if !ok {
 		t.Fatal("dropped")
 	}
 	b, _ := json.Marshal(p)
-	// http(s) data passes through as a URL, not a data URI.
+	// The URL form passes through verbatim, not as a data URI.
 	if !strings.Contains(string(b), `"url":"https://x/1.png"`) {
 		t.Errorf("got %s", b)
+	}
+}
+
+func TestConvertUserMessageMedia(t *testing.T) {
+	m := &ai.UserMessage{Role: ai.RoleUser, Content: []ai.UserContent{
+		&ai.AudioContent{Type: ai.ContentTypeAudio, Data: "QUFB", MimeType: "audio/wav"},
+		&ai.VideoContent{Type: ai.ContentTypeVideo, URL: "https://x/v.mp4"},
+	}}
+	p, ok, err := convertUserMessage(m)
+	if err != nil {
+		t.Fatalf("convertUserMessage: %v", err)
+	}
+	if !ok {
+		t.Fatal("dropped")
+	}
+	b, _ := json.Marshal(p)
+	for _, want := range []string{
+		`"type":"input_audio"`, `"data":"QUFB"`, `"format":"wav"`,
+		`"type":"video_url"`, `"url":"https://x/v.mp4"`,
+	} {
+		if !strings.Contains(string(b), want) {
+			t.Errorf("missing %q in %s", want, b)
+		}
+	}
+}
+
+func TestConvertUserMessageMediaUnionErrors(t *testing.T) {
+	for _, c := range []ai.UserContent{
+		&ai.ImageContent{Type: ai.ContentTypeImage},                                                        // neither form
+		&ai.AudioContent{Type: ai.ContentTypeAudio, Data: "QUFB", MimeType: "audio/wav", URL: "https://x"}, // both forms
+		&ai.VideoContent{Type: ai.ContentTypeVideo, Data: "QUFB"},                                          // data without mime
+	} {
+		m := &ai.UserMessage{Role: ai.RoleUser, Content: []ai.UserContent{c}}
+		if _, _, err := convertUserMessage(m); err == nil {
+			t.Errorf("%T should be rejected", c)
+		}
 	}
 }

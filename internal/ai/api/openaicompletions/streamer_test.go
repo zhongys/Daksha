@@ -9,7 +9,6 @@ import (
 	"testing"
 
 	"github.com/zhongys/Daksha/internal/ai"
-	"github.com/zhongys/Daksha/internal/ai/openai"
 )
 
 // sseServer returns an httptest server that writes the given SSE data lines.
@@ -55,8 +54,9 @@ func TestStreamerFullTurn(t *testing.T) {
 	})
 	defer server.Close()
 
-	s := NewStreamer(ai.Provider{Name: "deepseek", BaseURL: server.URL + "/"}, openai.WithAPIKey("k"))
+	s := NewStreamer()
 	stream := s.Stream(context.Background(),
+		ai.Provider{Name: "deepseek", BaseURL: server.URL + "/", APIKey: "k"},
 		ai.Model{Provider: "deepseek", ID: "deepseek-reasoner", Reasoning: true},
 		ai.Prompt{Messages: []ai.Message{userText("hi")}},
 		ai.StreamOptions{ReasoningEffort: "high"},
@@ -132,8 +132,9 @@ func TestStreamerReasoningFieldFallback(t *testing.T) {
 	})
 	defer server.Close()
 
-	s := NewStreamer(ai.Provider{Name: "openrouter", BaseURL: server.URL + "/"}, openai.WithAPIKey("k"))
-	stream := s.Stream(context.Background(), ai.Model{ID: "m"},
+	s := NewStreamer()
+	stream := s.Stream(context.Background(),
+		ai.Provider{Name: "openrouter", BaseURL: server.URL + "/", APIKey: "k"}, ai.Model{ID: "m"},
 		ai.Prompt{Messages: []ai.Message{userText("hi")}}, ai.StreamOptions{})
 
 	_, msg, err := collectStream(t, stream)
@@ -153,8 +154,9 @@ func TestStreamerUnknownFinishReasonIsError(t *testing.T) {
 	})
 	defer server.Close()
 
-	s := NewStreamer(ai.Provider{BaseURL: server.URL + "/"}, openai.WithAPIKey("k"))
-	stream := s.Stream(context.Background(), ai.Model{ID: "m"},
+	s := NewStreamer()
+	stream := s.Stream(context.Background(),
+		ai.Provider{BaseURL: server.URL + "/", APIKey: "k"}, ai.Model{ID: "m"},
 		ai.Prompt{Messages: []ai.Message{userText("hi")}}, ai.StreamOptions{})
 
 	events, msg, _ := collectStream(t, stream)
@@ -174,8 +176,9 @@ func TestStreamerMissingFinishReasonIsError(t *testing.T) {
 	})
 	defer server.Close()
 
-	s := NewStreamer(ai.Provider{BaseURL: server.URL + "/"}, openai.WithAPIKey("k"))
-	stream := s.Stream(context.Background(), ai.Model{ID: "m"},
+	s := NewStreamer()
+	stream := s.Stream(context.Background(),
+		ai.Provider{BaseURL: server.URL + "/", APIKey: "k"}, ai.Model{ID: "m"},
 		ai.Prompt{Messages: []ai.Message{userText("hi")}}, ai.StreamOptions{})
 
 	_, msg, _ := collectStream(t, stream)
@@ -192,8 +195,9 @@ func TestStreamerHTTPErrorEncodedInStream(t *testing.T) {
 	}))
 	defer server.Close()
 
-	s := NewStreamer(ai.Provider{BaseURL: server.URL + "/"}, openai.WithAPIKey("k"))
-	stream := s.Stream(context.Background(), ai.Model{ID: "m"},
+	s := NewStreamer()
+	stream := s.Stream(context.Background(),
+		ai.Provider{BaseURL: server.URL + "/", APIKey: "k"}, ai.Model{ID: "m"},
 		ai.Prompt{Messages: []ai.Message{userText("hi")}}, ai.StreamOptions{})
 
 	events, msg, err := collectStream(t, stream)
@@ -215,8 +219,9 @@ func TestStreamerErrorEventInStream(t *testing.T) {
 	})
 	defer server.Close()
 
-	s := NewStreamer(ai.Provider{BaseURL: server.URL + "/"}, openai.WithAPIKey("k"))
-	stream := s.Stream(context.Background(), ai.Model{ID: "m"},
+	s := NewStreamer()
+	stream := s.Stream(context.Background(),
+		ai.Provider{BaseURL: server.URL + "/", APIKey: "k"}, ai.Model{ID: "m"},
 		ai.Prompt{Messages: []ai.Message{userText("hi")}}, ai.StreamOptions{})
 
 	_, msg, err := collectStream(t, stream)

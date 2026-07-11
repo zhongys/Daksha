@@ -1,34 +1,51 @@
 package ai
 
-// Provider describes an OpenAI-compatible endpoint. Vendors that speak the
-// same wire protocol differ only in configuration, so a provider is data,
-// not code: adding a vendor means adding an entry here. Only a genuinely
+// Provider describes one endpoint. Vendors that speak the same wire protocol
+// differ only in configuration, so a provider is data, not code: adding a
+// vendor means adding an entry to a Client's registry. Only a genuinely
 // different wire protocol (e.g. Anthropic Messages) warrants a new adapter
 // package next to ai/api/openaicompletions.
 type Provider struct {
 	Name    string
 	BaseURL string
-	// APIKeyEnv names the environment variable holding the API key.
+	// API names the wire protocol this endpoint speaks and selects the
+	// adapter in the Client's route table. Empty means "openai-completions".
+	// A vendor exposing two protocols is two Provider entries.
+	API string
+	// APIKey is the key itself, filled by the application (database, secret
+	// manager). Resolved on every Stream call, so rotation takes effect
+	// immediately.
+	APIKey string
+	// APIKeyEnv names an environment variable used as a development-time
+	// fallback when APIKey is empty.
 	APIKeyEnv string
+	// Compat overrides endpoint quirk detection. Unset fields fall back to
+	// auto-detection from BaseURL.
+	Compat *OpenAICompat
 	// Extra carries provider-specific request fields merged into the
 	// top-level request JSON, e.g. Qwen's enable_thinking.
 	Extra map[string]any
 }
 
-var BuiltinProviders = map[string]Provider{
-	"openai": {
-		Name:      "openai",
-		BaseURL:   "https://api.openai.com/v1/",
-		APIKeyEnv: "OPENAI_API_KEY",
-	},
-	"deepseek": {
-		Name:      "deepseek",
-		BaseURL:   "https://api.deepseek.com/",
-		APIKeyEnv: "DEEPSEEK_API_KEY",
-	},
-	"qwen": {
-		Name:      "qwen",
-		BaseURL:   "https://dashscope.aliyuncs.com/compatible-mode/v1/",
-		APIKeyEnv: "DASHSCOPE_API_KEY",
-	},
+// SeedProviders returns starter entries for well-known endpoints. Pure data,
+// no side effects: main decides whether to load them into a Client. The model
+// catalog has no seed — its source of truth is the application's storage.
+func SeedProviders() []Provider {
+	return []Provider{
+		{
+			Name:      "openai",
+			BaseURL:   "https://api.openai.com/v1/",
+			APIKeyEnv: "OPENAI_API_KEY",
+		},
+		{
+			Name:      "deepseek",
+			BaseURL:   "https://api.deepseek.com/",
+			APIKeyEnv: "DEEPSEEK_API_KEY",
+		},
+		{
+			Name:      "qwen",
+			BaseURL:   "https://dashscope.aliyuncs.com/compatible-mode/v1/",
+			APIKeyEnv: "DASHSCOPE_API_KEY",
+		},
+	}
 }

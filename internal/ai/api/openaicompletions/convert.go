@@ -10,7 +10,9 @@ import (
 )
 
 // resolvedCompat is the fully-resolved quirk configuration for one request:
-// auto-detected from the provider's base URL, then overridden by model.Compat.
+// auto-detected from the provider's base URL, then overridden by
+// provider.Compat. Quirks are endpoint properties, so they live on the
+// Provider; a model needing different quirks is a second Provider entry.
 type resolvedCompat struct {
 	maxTokensField                              string
 	thinkingFormat                              ai.ThinkingFormat
@@ -48,9 +50,9 @@ func detectCompat(baseURL string) resolvedCompat {
 	return c
 }
 
-func resolveCompat(provider ai.Provider, model ai.Model) resolvedCompat {
+func resolveCompat(provider ai.Provider) resolvedCompat {
 	c := detectCompat(provider.BaseURL)
-	o := model.Compat
+	o := provider.Compat
 	if o == nil {
 		return c
 	}
@@ -70,7 +72,7 @@ func resolveCompat(provider ai.Provider, model ai.Model) resolvedCompat {
 }
 
 func buildParams(provider ai.Provider, model ai.Model, prompt ai.Prompt, opts ai.StreamOptions) (openai.ChatCompletionNewParams, error) {
-	compat := resolveCompat(provider, model)
+	compat := resolveCompat(provider)
 
 	messages, err := convertMessages(prompt, model, compat)
 	if err != nil {
@@ -170,7 +172,11 @@ func convertMessages(prompt ai.Prompt, model ai.Model, compat resolvedCompat) ([
 	for i := 0; i < len(msgs); i++ {
 		switch m := msgs[i].(type) {
 		case *ai.UserMessage:
-			if p, ok := convertUserMessage(m); ok {
+			p, ok, err := convertUserMessage(m)
+			if err != nil {
+				return nil, err
+			}
+			if ok {
 				params = append(params, p)
 			}
 
@@ -190,7 +196,10 @@ func convertMessages(prompt ai.Prompt, model ai.Model, compat resolvedCompat) ([
 				if !ok {
 					break
 				}
-				toolMsg, imgs := convertToolResult(tr)
+				toolMsg, imgs, err := convertToolResult(tr)
+				if err != nil {
+					return nil, err
+				}
 				params = append(params, toolMsg)
 				images = append(images, imgs...)
 			}
@@ -210,11 +219,11 @@ func convertMessages(prompt ai.Prompt, model ai.Model, compat resolvedCompat) ([
 	return params, nil
 }
 
-func convertUserMessage(m *ai.UserMessage) (openai.ChatCompletionMessageParamUnion, bool) {
+func convertUserMessage(m *ai.UserMessage) (openai.ChatCompletionMessageParamUnion, bool, error) {
 	// Single text block goes out as a plain string, the most compatible form.
 	if len(m.Content) == 1 {
 		if t, ok := m.Content[0].(*ai.TextContent); ok {
-			return openai.UserMessage(t.Text), true
+			return openai.UserMessage(t.Text), true, nil
 		}
 	}
 
@@ -224,15 +233,31 @@ func convertUserMessage(m *ai.UserMessage) (openai.ChatCompletionMessageParamUni
 		case *ai.TextContent:
 			parts = append(parts, openai.TextContentPart(v.Text))
 		case *ai.ImageContent:
+			ref, err := imageRef(v)
+			if err != nil {
+				return openai.ChatCompletionMessageParamUnion{}, false, err
+			}
 			parts = append(parts, openai.ImageContentPart(openai.ChatCompletionContentPartImageImageURLParam{
-				URL: imageURL(v),
+				URL: ref,
 			}))
+		case *ai.AudioContent:
+			part, err := audioPart(v)
+			if err != nil {
+				return openai.ChatCompletionMessageParamUnion{}, false, err
+			}
+			parts = append(parts, part)
+		case *ai.VideoContent:
+			part, err := videoPart(v)
+			if err != nil {
+				return openai.ChatCompletionMessageParamUnion{}, false, err
+			}
+			parts = append(parts, part)
 		}
 	}
 	if len(parts) == 0 {
-		return openai.ChatCompletionMessageParamUnion{}, false
+		return openai.ChatCompletionMessageParamUnion{}, false, nil
 	}
-	return openai.UserMessage(parts), true
+	return openai.UserMessage(parts), true, nil
 }
 
 func convertAssistantMessage(m *ai.AssistantMessage, model ai.Model, compat resolvedCompat) (openai.ChatCompletionMessageParamUnion, bool) {
@@ -309,7 +334,7 @@ func convertAssistantMessage(m *ai.AssistantMessage, model ai.Model, compat reso
 	return openai.ChatCompletionMessageParamUnion{OfAssistant: &assistant}, true
 }
 
-func convertToolResult(tr ai.ToolResult) (openai.ChatCompletionMessageParamUnion, []openai.ChatCompletionContentPartUnionParam) {
+func convertToolResult(tr ai.ToolResult) (openai.ChatCompletionMessageParamUnion, []openai.ChatCompletionContentPartUnionParam, error) {
 	toolCallID, _, content, _ := tr.ToolResultData()
 
 	var texts []string
@@ -319,8 +344,12 @@ func convertToolResult(tr ai.ToolResult) (openai.ChatCompletionMessageParamUnion
 		case *ai.TextContent:
 			texts = append(texts, v.Text)
 		case *ai.ImageContent:
+			ref, err := imageRef(v)
+			if err != nil {
+				return openai.ChatCompletionMessageParamUnion{}, nil, err
+			}
 			images = append(images, openai.ImageContentPart(openai.ChatCompletionContentPartImageImageURLParam{
-				URL: imageURL(v),
+				URL: ref,
 			}))
 		}
 	}
@@ -333,12 +362,59 @@ func convertToolResult(tr ai.ToolResult) (openai.ChatCompletionMessageParamUnion
 			text = "(no tool output)"
 		}
 	}
-	return openai.ToolMessage(text, toolCallID), images
+	return openai.ToolMessage(text, toolCallID), images, nil
 }
 
-func imageURL(img *ai.ImageContent) string {
-	if strings.HasPrefix(img.Data, "http://") || strings.HasPrefix(img.Data, "https://") {
-		return img.Data
+// Media encoding: this layer never downloads or transcodes. URL forms are
+// passed through verbatim and inline data goes out as base64; an endpoint
+// that cannot accept the given form rejects the request, which surfaces
+// loudly as an ErrorEvent.
+
+func imageRef(img *ai.ImageContent) (string, error) {
+	if err := img.Validate(); err != nil {
+		return "", err
 	}
-	return fmt.Sprintf("data:%s;base64,%s", img.MimeType, img.Data)
+	if img.URL != "" {
+		return img.URL, nil
+	}
+	return fmt.Sprintf("data:%s;base64,%s", img.MimeType, img.Data), nil
+}
+
+func audioPart(a *ai.AudioContent) (openai.ChatCompletionContentPartUnionParam, error) {
+	if err := a.Validate(); err != nil {
+		return openai.ChatCompletionContentPartUnionParam{}, err
+	}
+	// The OpenAI standard takes base64 in input_audio.data; DashScope also
+	// accepts a URL in the same slot.
+	if a.URL != "" {
+		return openai.InputAudioContentPart(openai.ChatCompletionContentPartInputAudioInputAudioParam{
+			Data: a.URL,
+		}), nil
+	}
+	return openai.InputAudioContentPart(openai.ChatCompletionContentPartInputAudioInputAudioParam{
+		Data:   a.Data,
+		Format: audioFormat(a.MimeType),
+	}), nil
+}
+
+func audioFormat(mimeType string) string {
+	switch mimeType {
+	case "audio/mpeg", "audio/mp3":
+		return "mp3"
+	case "audio/wav", "audio/x-wav", "audio/wave":
+		return "wav"
+	default:
+		return strings.TrimPrefix(mimeType, "audio/")
+	}
+}
+
+func videoPart(v *ai.VideoContent) (openai.ChatCompletionContentPartUnionParam, error) {
+	if err := v.Validate(); err != nil {
+		return openai.ChatCompletionContentPartUnionParam{}, err
+	}
+	url := v.URL
+	if url == "" {
+		url = fmt.Sprintf("data:%s;base64,%s", v.MimeType, v.Data)
+	}
+	return openai.VideoContentPart(openai.ChatCompletionContentPartVideoVideoURLParam{URL: url}), nil
 }
