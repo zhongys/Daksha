@@ -4,27 +4,23 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/zhongys/Daksha/internal/agent"
 	"github.com/zhongys/Daksha/internal/ai"
 	"github.com/zhongys/Daksha/internal/ai/api/openaicompletions"
 )
 
 func main() {
-	// Assembly: one stateless adapter per wire protocol, injected explicitly.
+	// ai layer assembly: one stateless adapter per wire protocol.
 	client := ai.NewClient(map[string]ai.Streamer{
 		"openai-completions": openaicompletions.NewStreamer(),
 	})
-
-	// Seed well-known endpoints; keys resolve from env (APIKey field wins
-	// when the application fills it from storage).
 	for _, p := range ai.SeedProviders() {
 		if err := client.PutProvider(p); err != nil {
 			panic(err)
 		}
 	}
-
-	// In production the model catalog lives in the database and is synced
-	// into the registry; a dev entry is a few lines. Pricing is nano-yuan
-	// per token: ¥4/MTok in, ¥16/MTok out, ¥0.8/MTok cache read.
+	// In production the model catalog is synced from the database. Pricing
+	// is nano-yuan per token: ¥4/MTok in, ¥16/MTok out, ¥0.8/MTok cache read.
 	if err := client.PutModel(ai.Model{
 		Provider: "deepseek",
 		ID:       "deepseek-chat",
@@ -34,32 +30,45 @@ func main() {
 		panic(err)
 	}
 
-	prompt := ai.Prompt{
-		Messages: []ai.Message{&ai.UserMessage{
-			Role: ai.RoleUser,
-			Content: []ai.UserContent{
-				&ai.TextContent{Type: ai.ContentTypeText, Text: "用一句话介绍你自己。"},
-			},
-		}},
+	// agent layer assembly: the application talks to the Agent only.
+	a, err := agent.New(agent.Config{
+		LLM:          client,
+		Provider:     "deepseek",
+		Model:        "deepseek-chat",
+		SystemPrompt: "You are a concise assistant.",
+		MaxTurns:     8,
+	})
+	if err != nil {
+		panic(err)
 	}
 
 	ctx := context.Background()
-	stream := client.Stream(ctx, "deepseek", "deepseek-chat", prompt, ai.StreamOptions{})
+	stream, err := a.PromptText(ctx, "用一句话介绍你自己。")
+	if err != nil {
+		panic(err)
+	}
 	for ev := range stream.Events() {
-		if delta, ok := ev.(ai.TextDeltaEvent); ok {
-			fmt.Print(delta.Delta)
+		if update, ok := ev.(agent.MessageUpdateEvent); ok {
+			if delta, ok := update.Inner.(ai.TextDeltaEvent); ok {
+				fmt.Print(delta.Delta)
+			}
 		}
 	}
 	fmt.Println()
 
-	msg, err := stream.Result(ctx)
+	res, err := stream.Result(ctx)
 	if err != nil {
 		panic(err)
 	}
-	if msg.StopReason == ai.StopReasonError || msg.StopReason == ai.StopReasonAborted {
-		fmt.Printf("turn failed: %s\n", msg.ErrorMessage)
+	if res.Err != nil {
+		fmt.Printf("run failed: %v\n", res.Err)
+		return
+	}
+	if res.Last.StopReason == ai.StopReasonError || res.Last.StopReason == ai.StopReasonAborted {
+		fmt.Printf("turn failed: %s\n", res.Last.ErrorMessage)
 		return
 	}
 	fmt.Printf("tokens: in=%d out=%d, cost: %d nano-yuan (¥%.6f)\n",
-		msg.Usage.Input, msg.Usage.Output, msg.Usage.Cost.Total, float64(msg.Usage.Cost.Total)/1e9)
+		res.Last.Usage.Input, res.Last.Usage.Output,
+		res.Last.Usage.Cost.Total, float64(res.Last.Usage.Cost.Total)/1e9)
 }
