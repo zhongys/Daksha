@@ -4,9 +4,9 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/zhongys/Daksha/internal/agent"
-	"github.com/zhongys/Daksha/internal/ai"
-	"github.com/zhongys/Daksha/internal/ai/api/openaicompletions"
+	"github.com/zhongys/Daksha/agent"
+	"github.com/zhongys/Daksha/ai"
+	"github.com/zhongys/Daksha/ai/api/openaicompletions"
 )
 
 func main() {

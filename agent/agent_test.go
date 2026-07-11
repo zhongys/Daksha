@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/zhongys/Daksha/internal/ai"
+	"github.com/zhongys/Daksha/ai"
 )
 
 // fakeLLM replays a script of assistant messages, one per Stream call, and

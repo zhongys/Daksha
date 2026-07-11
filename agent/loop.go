@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/zhongys/Daksha/internal/ai"
+	"github.com/zhongys/Daksha/ai"
 )
 
 // runConfig is the per-turn snapshot of the agent's mutable configuration:

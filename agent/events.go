@@ -1,6 +1,6 @@
 package agent
 
-import "github.com/zhongys/Daksha/internal/ai"
+import "github.com/zhongys/Daksha/ai"
 
 type EventType string
 

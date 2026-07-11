@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/zhongys/Daksha/internal/ai"
+	"github.com/zhongys/Daksha/ai"
 )
 
 // ExecutionMode selects how the tool calls of one assistant message run.

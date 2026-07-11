@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/zhongys/Daksha/internal/ai"
-	"github.com/zhongys/Daksha/internal/ai/openai"
+	"github.com/zhongys/Daksha/ai"
+	"github.com/zhongys/Daksha/ai/openai"
 )
 
 const apiName = "openai-completions"

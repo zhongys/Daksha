@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/zhongys/Daksha/internal/ai"
-	"github.com/zhongys/Daksha/internal/ai/openai"
+	"github.com/zhongys/Daksha/ai"
+	"github.com/zhongys/Daksha/ai/openai"
 )
 
 // resolvedCompat is the fully-resolved quirk configuration for one request:

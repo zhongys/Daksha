@@ -8,7 +8,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/zhongys/Daksha/internal/ai"
+	"github.com/zhongys/Daksha/ai"
 )
 
 // sseServer returns an httptest server that writes the given SSE data lines.

@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/zhongys/Daksha/internal/ai"
+	"github.com/zhongys/Daksha/ai"
 )
 
 // LLM is the slice of the ai layer the agent consumes — satisfied by
