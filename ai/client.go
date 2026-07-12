@@ -23,7 +23,8 @@ type Client struct {
 	providers map[string]Provider
 	models    map[string]map[string]Model // provider name -> model id
 
-	adapters map[string]Streamer
+	adapters  map[string]Streamer
+	embedders map[string]Embedder
 }
 
 // NewClient builds a Client with an explicit protocol route table, e.g.
@@ -39,6 +40,7 @@ func NewClient(adapters map[string]Streamer) *Client {
 		providers: map[string]Provider{},
 		models:    map[string]map[string]Model{},
 		adapters:  map[string]Streamer{},
+		embedders: map[string]Embedder{},
 	}
 	for name, s := range adapters {
 		c.adapters[name] = s
@@ -165,36 +167,45 @@ func (c *Client) Complete(ctx context.Context, providerName, modelID string, pro
 // the adapter. The returned provider is a value copy with APIKey filled in,
 // so key rotation and registry edits never touch requests already running.
 func (c *Client) resolve(providerName, modelID string) (Provider, Model, Streamer, error) {
+	provider, model, err := c.resolveEntry(providerName, modelID)
+	if err != nil {
+		return provider, model, nil, err
+	}
+	adapter, ok := c.adapters[provider.API]
+	if !ok {
+		return provider, model, nil, fmt.Errorf("ai: no adapter registered for protocol %q", provider.API)
+	}
+	return provider, model, adapter, nil
+}
+
+// resolveEntry snapshots the provider and model and resolves the API key —
+// the adapter-independent half of resolve, shared by Stream and Embed. The
+// returned provider always has API defaulted and APIKey filled in.
+func (c *Client) resolveEntry(providerName, modelID string) (Provider, Model, error) {
 	c.mu.RLock()
 	provider, okP := c.providers[providerName]
 	model, okM := c.models[providerName][modelID]
 	c.mu.RUnlock()
 
 	if !okP {
-		return provider, model, nil, fmt.Errorf("ai: unknown provider %q", providerName)
+		return provider, model, fmt.Errorf("ai: unknown provider %q", providerName)
 	}
 	if !okM {
-		return provider, model, nil, fmt.Errorf("ai: unknown model %q on provider %q", modelID, providerName)
+		return provider, model, fmt.Errorf("ai: unknown model %q on provider %q", modelID, providerName)
 	}
 
 	if provider.APIKey == "" && provider.APIKeyEnv != "" {
 		provider.APIKey = os.Getenv(provider.APIKeyEnv)
 	}
 	if provider.APIKey == "" {
-		return provider, model, nil, fmt.Errorf("ai: no API key for provider %q (set APIKey or env %s)",
+		return provider, model, fmt.Errorf("ai: no API key for provider %q (set APIKey or env %s)",
 			providerName, provider.APIKeyEnv)
 	}
 
-	api := provider.API
-	if api == "" {
-		api = "openai-completions"
-		provider.API = api
+	if provider.API == "" {
+		provider.API = "openai-completions"
 	}
-	adapter, ok := c.adapters[api]
-	if !ok {
-		return provider, model, nil, fmt.Errorf("ai: no adapter registered for protocol %q", api)
-	}
-	return provider, model, adapter, nil
+	return provider, model, nil
 }
 
 // checkCapabilities enforces the model's content switches before dispatch.

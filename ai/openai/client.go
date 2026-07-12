@@ -5,13 +5,15 @@ package openai
 // the official openai client): it knows nothing about the neutral ai layer.
 // Vendor differences come in through RequestOptions.
 type Client struct {
-	Options []RequestOption
-	Chat    ChatService
+	Options    []RequestOption
+	Chat       ChatService
+	Embeddings EmbeddingService
 }
 
 func NewClient(opts ...RequestOption) Client {
 	return Client{
-		Options: opts,
-		Chat:    NewChatService(opts...),
+		Options:    opts,
+		Chat:       NewChatService(opts...),
+		Embeddings: NewEmbeddingService(opts...),
 	}
 }
