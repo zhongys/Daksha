@@ -109,10 +109,11 @@ type JSONSchema struct {
 	Strict      bool
 }
 
-// OutputFormat constrains the assistant's final text. JSON outputs still arrive
-// as text deltas while streaming, but adapters must validate the complete text
-// as JSON before reporting a successful final result. JSONSchema conformance is
-// enforced by the provider; local final validation guarantees JSON syntax only.
+// OutputFormat constrains the assistant's final response. JSON outputs arrive
+// through JSONStart/JSONDelta/JSONEnd events; adapters must validate the
+// complete value before publishing JSONEnd or a successful final result.
+// JSONSchema conformance is enforced by the provider; local final validation
+// guarantees JSON syntax only.
 type OutputFormat struct {
 	Type       OutputFormatType
 	JSONSchema *JSONSchema

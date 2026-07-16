@@ -36,6 +36,14 @@ type ToolOutput struct {
 	// call. It only takes effect when every finalized result in the batch
 	// sets it.
 	Terminate bool
+	// terminal is set only by NewTerminalTool. Keeping this marker private
+	// prevents legacy Terminate tools from being reinterpreted as business
+	// output.
+	terminal *terminalValue
+}
+
+type terminalValue struct {
+	value any
 }
 
 // Tool is one callable exposed to the model.
@@ -81,6 +89,25 @@ func NewTool[P any](def ToolDefinition,
 	fn func(ctx context.Context, toolCallID string, params P, onUpdate func(ToolUpdate)) (*ToolOutput, error),
 ) Tool {
 	return &typedTool[P]{def: def, fn: fn}
+}
+
+// NewTerminalTool creates a typed output tool whose arguments are the run's
+// final business value. A successful call stores params in the tool-result
+// Details, marks the batch for termination, and exposes the same concrete P
+// through RunResult.Output and AgentEndEvent.Output.
+//
+// The terminal value takes effect only when the whole tool-call batch
+// terminates, matching ToolOutput.Terminate semantics. The model should
+// therefore call a terminal tool by itself.
+func NewTerminalTool[P any](def ToolDefinition) Tool {
+	return NewTool[P](def,
+		func(_ context.Context, _ string, params P, _ func(ToolUpdate)) (*ToolOutput, error) {
+			return &ToolOutput{
+				Details:   params,
+				Terminate: true,
+				terminal:  &terminalValue{value: params},
+			}, nil
+		})
 }
 
 type typedTool[P any] struct {

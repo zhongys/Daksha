@@ -103,6 +103,7 @@ func (a *Agent) run(ctx context.Context, cancel context.CancelFunc, runID uint64
 	em := &emitter{ctx: ctx, producer: producer}
 	var newMessages []ai.Message
 	var last *ai.AssistantMessage
+	var runOutput *RunOutput
 	var runErr error
 
 	record := func(m ai.Message) {
@@ -165,13 +166,18 @@ func (a *Agent) run(ctx context.Context, cancel context.CancelFunc, runID uint64
 
 		var toolResults []ai.Message
 		terminate := false
+		var toolErr error
 		if final.StopReason == ai.StopReasonToolUse {
-			toolResults, terminate = a.executeTools(ctx, em, cfg, final)
+			toolResults, terminate, runOutput, toolErr = a.executeTools(ctx, em, cfg, final)
 			for _, r := range toolResults {
 				newMessages = append(newMessages, r)
 			}
 		}
 		em.publish(TurnEndEvent{Turn: turn, Message: final, ToolResults: toolResults})
+		if toolErr != nil {
+			runErr = toolErr
+			break
+		}
 
 		if final.StopReason == ai.StopReasonError || final.StopReason == ai.StopReasonAborted {
 			break
@@ -208,12 +214,17 @@ func (a *Agent) run(ctx context.Context, cancel context.CancelFunc, runID uint64
 	if runErr == nil && em.err != nil {
 		runErr = em.err
 	}
-	em.publish(AgentEndEvent{NewMessages: newMessages})
+	em.publish(AgentEndEvent{NewMessages: newMessages, Output: runOutput})
 	// Result() must imply that the agent is ready for its next run. Retire
 	// before Complete makes the result visible; the run identity protects a
 	// new run from the deferred cleanup above.
 	a.retireRun(runID)
-	_ = producer.Complete(ctx, &RunResult{NewMessages: newMessages, Last: last, Err: runErr})
+	_ = producer.Complete(ctx, &RunResult{
+		NewMessages: newMessages,
+		Last:        last,
+		Output:      runOutput,
+		Err:         runErr,
+	})
 }
 
 // toolOutcome pairs one tool call with its finalized result.
@@ -221,6 +232,7 @@ type toolOutcome struct {
 	call      *ai.ToolCallContent
 	msg       *ai.ToolResultMessage[any]
 	terminate bool
+	output    *RunOutput
 	// pending marks outcomes whose permission checks passed and whose handler
 	// has not yet been finalized.
 	pending bool
@@ -234,7 +246,7 @@ type toolOutcome struct {
 // its permission hook nor handler is invoked. Already-running handlers still
 // get their canceled context and are allowed to unwind normally.
 func (a *Agent) executeTools(ctx context.Context, em *emitter, cfg runConfig,
-	final *ai.AssistantMessage) ([]ai.Message, bool) {
+	final *ai.AssistantMessage) ([]ai.Message, bool, *RunOutput, error) {
 
 	var calls []*ai.ToolCallContent
 	for _, c := range final.Content {
@@ -243,7 +255,7 @@ func (a *Agent) executeTools(ctx context.Context, em *emitter, cfg runConfig,
 		}
 	}
 	if len(calls) == 0 {
-		return nil, false
+		return nil, false, nil, nil
 	}
 
 	byName := map[string]Tool{}
@@ -348,6 +360,13 @@ func (a *Agent) executeTools(ctx context.Context, em *emitter, cfg runConfig,
 		} else {
 			o.msg = successResult(o.call, out)
 			o.terminate = out != nil && out.Terminate
+			if out != nil && out.terminal != nil {
+				o.output = &RunOutput{
+					ToolCallID: o.call.Id,
+					ToolName:   o.call.Name,
+					Value:      out.terminal.value,
+				}
+			}
 		}
 		em.publish(ToolExecutionEndEvent{
 			ToolCallID: o.call.Id, ToolName: o.call.Name, Result: o.msg, IsError: o.msg.IsError,
@@ -394,6 +413,7 @@ func (a *Agent) executeTools(ctx context.Context, em *emitter, cfg runConfig,
 	// Record in assistant source order regardless of completion order.
 	results := make([]ai.Message, 0, len(outcomes))
 	terminate := true
+	var outputs []*RunOutput
 	for _, o := range outcomes {
 		a.appendMessage(o.msg)
 		em.announce(o.msg)
@@ -401,8 +421,24 @@ func (a *Agent) executeTools(ctx context.Context, em *emitter, cfg runConfig,
 		if !o.terminate {
 			terminate = false
 		}
+		if o.output != nil {
+			outputs = append(outputs, o.output)
+		}
 	}
-	return results, terminate
+	if !terminate {
+		return results, false, nil, nil
+	}
+	switch len(outputs) {
+	case 0:
+		// Preserve the existing control-only Terminate behavior.
+		return results, true, nil, nil
+	case 1:
+		return results, true, outputs[0], nil
+	default:
+		return results, true, nil, fmt.Errorf(
+			"agent: terminal tool batch produced %d outputs; exactly one is allowed", len(outputs),
+		)
+	}
 }
 
 func errorResult(call *ai.ToolCallContent, err error) *ai.ToolResultMessage[any] {
@@ -456,6 +492,12 @@ func partialOf(ev ai.AssistantMessageEvent) *ai.AssistantMessage {
 	case ai.TextDeltaEvent:
 		p = e.Partial
 	case ai.TextEndEvent:
+		p = e.Partial
+	case ai.JSONStartEvent:
+		p = e.Partial
+	case ai.JSONDeltaEvent:
+		p = e.Partial
+	case ai.JSONEndEvent:
 		p = e.Partial
 	case ai.ThinkingStartEvent:
 		p = e.Partial

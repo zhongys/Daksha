@@ -24,6 +24,7 @@ func TestUnmarshalMessagesRoundTrip(t *testing.T) {
 			Content: []AssistantContent{
 				&ThinkingContent{Type: ContentTypeThinking, Thinking: "hmm", ThinkingSignature: "reasoning_content"},
 				&TextContent{Type: ContentTypeText, Text: "calling a tool"},
+				&JSONContent{Type: ContentTypeJSON, SchemaName: "answer", Value: json.RawMessage(`{"id":9007199254740993}`)},
 				&ToolCallContent{Type: ContentTypeToolCall, Id: "c1", Name: "read_file",
 					Arguments: map[string]any{"path": "/tmp/x"}},
 			},
@@ -76,8 +77,12 @@ func TestUnmarshalMessagesRoundTrip(t *testing.T) {
 		t.Errorf("user content[2] = %T, want *AudioContent", user.Content[2])
 	}
 	assistant := decoded[1].(*AssistantMessage)
-	if tc, ok := assistant.Content[2].(*ToolCallContent); !ok || tc.Name != "read_file" {
-		t.Errorf("assistant content[2] = %+v", assistant.Content[2])
+	structured, ok := assistant.Content[2].(*JSONContent)
+	if !ok || structured.SchemaName != "answer" || string(structured.Value) != `{"id":9007199254740993}` {
+		t.Errorf("assistant content[2] = %#v", assistant.Content[2])
+	}
+	if tc, ok := assistant.Content[3].(*ToolCallContent); !ok || tc.Name != "read_file" {
+		t.Errorf("assistant content[3] = %+v", assistant.Content[3])
 	}
 	if assistant.Usage.Cost.Input != 40000 {
 		t.Errorf("cost lost: %+v", assistant.Usage)

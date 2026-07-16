@@ -1,6 +1,9 @@
 package ai
 
-import "fmt"
+import (
+	"encoding/json"
+	"fmt"
+)
 
 type Role string
 
@@ -14,6 +17,7 @@ type ContentType string
 
 const (
 	ContentTypeText     ContentType = "text"
+	ContentTypeJSON     ContentType = "json"
 	ContentTypeImage    ContentType = "image"
 	ContentTypeAudio    ContentType = "audio"
 	ContentTypeVideo    ContentType = "video"
@@ -67,6 +71,7 @@ type ToolResultContent interface {
 func (*TextContent) isUserContent()          {}
 func (*TextContent) isAssistantContent()     {}
 func (*TextContent) isToolResultContent()    {}
+func (*JSONContent) isAssistantContent()     {}
 func (*ImageContent) isUserContent()         {}
 func (*ImageContent) isToolResultContent()   {}
 func (*AudioContent) isUserContent()         {}
@@ -78,6 +83,15 @@ type TextContent struct {
 	Type          ContentType `json:"type"`
 	Text          string      `json:"text"`
 	TextSignature string      `json:"textSignature,omitempty"`
+}
+
+// JSONContent is a validated structured assistant response. During streaming,
+// JSONStart/JSONDelta events carry an empty placeholder block; Value is filled
+// only after the complete response passes final JSON validation.
+type JSONContent struct {
+	Type       ContentType     `json:"type"`
+	SchemaName string          `json:"schemaName,omitempty"`
+	Value      json.RawMessage `json:"value,omitempty"`
 }
 
 // Media content blocks carry their payload either inline (Data, base64, with
@@ -219,6 +233,9 @@ const (
 	AssistantEventTextStart     AssistantMessageEventType = "text_start"
 	AssistantEventTextDelta     AssistantMessageEventType = "text_delta"
 	AssistantEventTextEnd       AssistantMessageEventType = "text_end"
+	AssistantEventJSONStart     AssistantMessageEventType = "json_start"
+	AssistantEventJSONDelta     AssistantMessageEventType = "json_delta"
+	AssistantEventJSONEnd       AssistantMessageEventType = "json_end"
 	AssistantEventThinkingStart AssistantMessageEventType = "thinking_start"
 	AssistantEventThinkingDelta AssistantMessageEventType = "thinking_delta"
 	AssistantEventThinkingEnd   AssistantMessageEventType = "thinking_end"
@@ -261,6 +278,32 @@ type TextEndEvent struct {
 }
 
 func (TextEndEvent) EventType() AssistantMessageEventType { return AssistantEventTextEnd }
+
+type JSONStartEvent struct {
+	ContentIndex int
+	Partial      AssistantMessage
+}
+
+func (JSONStartEvent) EventType() AssistantMessageEventType { return AssistantEventJSONStart }
+
+// JSONDeltaEvent carries an unvalidated fragment. Consumers may concatenate
+// Delta values for progressive display; only JSONEndEvent.Content is valid
+// complete JSON.
+type JSONDeltaEvent struct {
+	ContentIndex int
+	Delta        string
+	Partial      AssistantMessage
+}
+
+func (JSONDeltaEvent) EventType() AssistantMessageEventType { return AssistantEventJSONDelta }
+
+type JSONEndEvent struct {
+	ContentIndex int
+	Content      json.RawMessage
+	Partial      AssistantMessage
+}
+
+func (JSONEndEvent) EventType() AssistantMessageEventType { return AssistantEventJSONEnd }
 
 type ThinkingStartEvent struct {
 	ContentIndex int

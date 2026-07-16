@@ -176,10 +176,10 @@ func fail(ctx context.Context, producer *ai.Producer[ai.AssistantMessageEvent, *
 }
 
 // accumulator reassembles content blocks from streamed deltas and emits the
-// corresponding events. Mirrors pi-ai's block handling: text and thinking
-// are single open blocks, tool calls are keyed by stream index with an id
-// fallback for providers that omit the index, and all blocks close together
-// when the stream ends.
+// corresponding events. Text, structured JSON and thinking are single open
+// blocks; tool calls are keyed by stream index with an id fallback for
+// providers that omit the index, and all blocks close together when the
+// stream ends.
 type accumulator struct {
 	msg          *ai.AssistantMessage
 	producer     *ai.Producer[ai.AssistantMessageEvent, *ai.AssistantMessage]
@@ -187,6 +187,9 @@ type accumulator struct {
 
 	text        *ai.TextContent
 	textIdx     int
+	jsonContent *ai.JSONContent
+	jsonIdx     int
+	jsonBuffer  strings.Builder
 	thinking    *ai.ThinkingContent
 	thinkingIdx int
 	refusal     strings.Builder
@@ -216,6 +219,12 @@ func snapshotAssistantMessage(msg *ai.AssistantMessage) ai.AssistantMessage {
 					copy := *content
 					snapshot.Content[i] = &copy
 				}
+			case *ai.JSONContent:
+				if content != nil {
+					copy := *content
+					copy.Value = cloneRawMessage(content.Value)
+					snapshot.Content[i] = &copy
+				}
 			case *ai.ThinkingContent:
 				if content != nil {
 					copy := *content
@@ -234,6 +243,13 @@ func snapshotAssistantMessage(msg *ai.AssistantMessage) ai.AssistantMessage {
 	}
 	snapshot.Diagnostics.Details = cloneJSONMap(msg.Diagnostics.Details)
 	return snapshot
+}
+
+func cloneRawMessage(src json.RawMessage) json.RawMessage {
+	if src == nil {
+		return nil
+	}
+	return append(json.RawMessage(nil), src...)
 }
 
 func cloneJSONMap(src map[string]any) map[string]any {
@@ -298,21 +314,45 @@ func (a *accumulator) applyDelta(ctx context.Context, delta openai.ChatCompletio
 		a.msg.Diagnostics.Details["refusal"] = a.refusal.String()
 	}
 	if delta.Content != "" {
-		if a.text == nil {
-			a.text = &ai.TextContent{Type: ai.ContentTypeText}
-			a.textIdx = len(a.msg.Content)
-			a.msg.Content = append(a.msg.Content, a.text)
-			if err := a.producer.Publish(ctx, ai.TextStartEvent{
-				ContentIndex: a.textIdx, Partial: snapshotAssistantMessage(a.msg),
+		if a.outputFormat.IsJSON() {
+			if a.jsonContent == nil {
+				schemaName := ""
+				if a.outputFormat.JSONSchema != nil {
+					schemaName = a.outputFormat.JSONSchema.Name
+				}
+				a.jsonContent = &ai.JSONContent{Type: ai.ContentTypeJSON, SchemaName: schemaName}
+				a.jsonIdx = len(a.msg.Content)
+				a.msg.Content = append(a.msg.Content, a.jsonContent)
+				if err := a.producer.Publish(ctx, ai.JSONStartEvent{
+					ContentIndex: a.jsonIdx, Partial: snapshotAssistantMessage(a.msg),
+				}); err != nil {
+					return err
+				}
+			}
+			a.jsonBuffer.WriteString(delta.Content)
+			a.rememberRawJSON(a.jsonBuffer.String())
+			if err := a.producer.Publish(ctx, ai.JSONDeltaEvent{
+				ContentIndex: a.jsonIdx, Delta: delta.Content, Partial: snapshotAssistantMessage(a.msg),
 			}); err != nil {
 				return err
 			}
-		}
-		a.text.Text += delta.Content
-		if err := a.producer.Publish(ctx, ai.TextDeltaEvent{
-			ContentIndex: a.textIdx, Delta: delta.Content, Partial: snapshotAssistantMessage(a.msg),
-		}); err != nil {
-			return err
+		} else {
+			if a.text == nil {
+				a.text = &ai.TextContent{Type: ai.ContentTypeText}
+				a.textIdx = len(a.msg.Content)
+				a.msg.Content = append(a.msg.Content, a.text)
+				if err := a.producer.Publish(ctx, ai.TextStartEvent{
+					ContentIndex: a.textIdx, Partial: snapshotAssistantMessage(a.msg),
+				}); err != nil {
+					return err
+				}
+			}
+			a.text.Text += delta.Content
+			if err := a.producer.Publish(ctx, ai.TextDeltaEvent{
+				ContentIndex: a.textIdx, Delta: delta.Content, Partial: snapshotAssistantMessage(a.msg),
+			}); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -427,7 +467,7 @@ func (a *accumulator) startToolCall(ctx context.Context,
 	})
 }
 
-// finishAll validates completed tool arguments and structured final text before
+// finishAll validates completed tool arguments and structured final JSON before
 // closing open blocks in content order. Partial JSON is for UI updates only: no
 // terminal success event becomes observable until the relevant final buffers
 // satisfy their contracts.
@@ -442,15 +482,23 @@ func (a *accumulator) finishAll(ctx context.Context, validateFinalOutput bool) e
 		}
 		state.block.Arguments = arguments
 	}
-	if validateFinalOutput {
-		if err := a.validateFinalJSON(); err != nil {
-			return err
-		}
+	jsonFinalized, err := a.finalizeJSON(validateFinalOutput)
+	if err != nil {
+		return err
 	}
 
 	if a.text != nil {
 		if err := a.producer.Publish(ctx, ai.TextEndEvent{
 			ContentIndex: a.textIdx, Content: a.text.Text, Partial: snapshotAssistantMessage(a.msg),
+		}); err != nil {
+			return err
+		}
+	}
+	if jsonFinalized {
+		if err := a.producer.Publish(ctx, ai.JSONEndEvent{
+			ContentIndex: a.jsonIdx,
+			Content:      cloneRawMessage(a.jsonContent.Value),
+			Partial:      snapshotAssistantMessage(a.msg),
 		}); err != nil {
 			return err
 		}
@@ -474,34 +522,66 @@ func (a *accumulator) finishAll(ctx context.Context, validateFinalOutput bool) e
 	return nil
 }
 
-// validateFinalJSON runs only for a final assistant answer. A tool-call turn is
-// an intermediate agent step and may legitimately contain no JSON text even
-// when the eventual answer has a structured output contract.
-func (a *accumulator) validateFinalJSON() error {
-	if !a.outputFormat.IsJSON() || a.msg.StopReason == ai.StopReasonToolUse || a.msg.StopReason == ai.StopReasonError {
-		return nil
+// finalizeJSON publishes no terminal state itself. It validates and freezes a
+// complete JSON block only when the provider supplied a usable finish reason.
+// A tool-call-only turn is an intermediate agent step and may legitimately
+// contain no JSON block even when the eventual answer is structured. If a
+// structured tool-use turn does emit content, it must still be valid JSON so
+// its JSONStart event can close with JSONEnd rather than dangling at Done.
+func (a *accumulator) finalizeJSON(validateFinalOutput bool) (bool, error) {
+	if !a.outputFormat.IsJSON() {
+		return false, nil
+	}
+	raw := a.jsonBuffer.String()
+	if !validateFinalOutput || a.msg.StopReason == ai.StopReasonError || a.msg.StopReason == ai.StopReasonAborted {
+		if a.jsonContent != nil {
+			a.rememberRawJSON(raw)
+		}
+		return false, nil
+	}
+	if a.msg.StopReason == ai.StopReasonToolUse && a.jsonContent == nil {
+		return false, nil
 	}
 	if refusal := a.refusal.String(); refusal != "" {
-		return fmt.Errorf("openai: structured output refused: %s", refusal)
+		return false, fmt.Errorf("openai: structured output refused: %s", refusal)
 	}
-	if a.text == nil || strings.TrimSpace(a.text.Text) == "" {
-		return fmt.Errorf("openai: output format %q produced no JSON content", a.outputFormat.Type)
+	if a.jsonContent == nil || strings.TrimSpace(raw) == "" {
+		return false, fmt.Errorf("openai: output format %q produced no JSON content", a.outputFormat.Type)
 	}
 	if a.outputFormat.Type == ai.OutputFormatJSONObject {
 		var object map[string]json.RawMessage
-		if err := json.Unmarshal([]byte(a.text.Text), &object); err != nil {
-			return fmt.Errorf("openai: invalid final JSON object for output format %q: %w", a.outputFormat.Type, err)
+		if err := json.Unmarshal([]byte(raw), &object); err != nil {
+			a.rememberRawJSON(raw)
+			return false, fmt.Errorf("openai: invalid final JSON object for output format %q: %w", a.outputFormat.Type, err)
 		}
 		if object == nil {
-			return fmt.Errorf("openai: invalid final JSON object for output format %q: top-level value is null", a.outputFormat.Type)
+			a.rememberRawJSON(raw)
+			return false, fmt.Errorf("openai: invalid final JSON object for output format %q: top-level value is null", a.outputFormat.Type)
 		}
-		return nil
+	} else {
+		var value json.RawMessage
+		if err := json.Unmarshal([]byte(raw), &value); err != nil {
+			a.rememberRawJSON(raw)
+			return false, fmt.Errorf("openai: invalid final JSON for output format %q: %w", a.outputFormat.Type, err)
+		}
 	}
-	var value json.RawMessage
-	if err := json.Unmarshal([]byte(a.text.Text), &value); err != nil {
-		return fmt.Errorf("openai: invalid final JSON for output format %q: %w", a.outputFormat.Type, err)
+	a.jsonContent.Value = json.RawMessage([]byte(raw))
+	a.clearRawJSON()
+	return true, nil
+}
+
+func (a *accumulator) rememberRawJSON(raw string) {
+	if a.msg.Diagnostics.Details == nil {
+		a.msg.Diagnostics.Details = map[string]any{}
 	}
-	return nil
+	a.msg.Diagnostics.Details["rawJSON"] = raw
+}
+
+func (a *accumulator) clearRawJSON() {
+	delete(a.msg.Diagnostics.Details, "rawJSON")
+	if len(a.msg.Diagnostics.Details) == 0 {
+		a.msg.Diagnostics.Details = nil
+	}
 }
 
 func usageIsSet(u openai.CompletionUsage) bool {

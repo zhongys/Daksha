@@ -318,6 +318,12 @@ func convertAssistantMessage(m *ai.AssistantMessage, model ai.Model, compat reso
 			if strings.TrimSpace(v.Text) != "" {
 				texts = append(texts, v.Text)
 			}
+		case *ai.JSONContent:
+			// OpenAI-compatible history still represents structured assistant
+			// output as a content string on the wire.
+			if len(v.Value) > 0 {
+				texts = append(texts, string(v.Value))
+			}
 		case *ai.ThinkingContent:
 			if strings.TrimSpace(v.Thinking) != "" {
 				thinkings = append(thinkings, v.Thinking)

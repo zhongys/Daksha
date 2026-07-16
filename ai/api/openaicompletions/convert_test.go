@@ -333,6 +333,29 @@ func TestConvertAssistantMessage(t *testing.T) {
 	}
 }
 
+func TestConvertAssistantJSONMessage(t *testing.T) {
+	raw := json.RawMessage(`{"id":9007199254740993,"answer":"ok"}`)
+	m := &ai.AssistantMessage{
+		Role: ai.RoleAssistant,
+		Content: []ai.AssistantContent{&ai.JSONContent{
+			Type: ai.ContentTypeJSON, SchemaName: "answer", Value: raw,
+		}},
+	}
+
+	p, ok := convertAssistantMessage(m, ai.Model{}, resolvedCompat{})
+	if !ok {
+		t.Fatal("JSON assistant message dropped")
+	}
+	b, err := json.Marshal(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `"content":"{\"id\":9007199254740993,\"answer\":\"ok\"}"`
+	if !strings.Contains(string(b), want) {
+		t.Fatalf("JSON content was not replayed exactly: %s", b)
+	}
+}
+
 func TestConvertAssistantMessageDeepSeekEmptyReasoning(t *testing.T) {
 	m := &ai.AssistantMessage{
 		Role:    ai.RoleAssistant,

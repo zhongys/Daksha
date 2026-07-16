@@ -172,6 +172,8 @@ func unmarshalAssistantContent(raw json.RawMessage) (AssistantContent, error) {
 	switch t {
 	case ContentTypeText:
 		return decodeContent[TextContent](raw)
+	case ContentTypeJSON:
+		return decodeContent[JSONContent](raw)
 	case ContentTypeThinking:
 		return decodeContent[ThinkingContent](raw)
 	case ContentTypeToolCall:

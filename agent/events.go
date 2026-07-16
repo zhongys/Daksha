@@ -31,6 +31,8 @@ func (AgentStartEvent) EventType() EventType { return EventAgentStart }
 type AgentEndEvent struct {
 	// NewMessages are the messages appended to the context by this run.
 	NewMessages []ai.Message
+	// Output is present when a dedicated terminal tool ended the run.
+	Output *RunOutput
 }
 
 func (AgentEndEvent) EventType() EventType { return EventAgentEnd }
@@ -101,14 +103,39 @@ type ToolExecutionEndEvent struct {
 
 func (ToolExecutionEndEvent) EventType() EventType { return EventToolExecutionEnd }
 
+// RunOutput is the value accepted by a dedicated terminal tool. Value retains
+// the concrete parameter type P supplied to NewTerminalTool[P]; ToolCallID and
+// ToolName identify the model call that produced it.
+type RunOutput struct {
+	ToolCallID string
+	ToolName   string
+	Value      any
+}
+
+// RunOutputAs returns a terminal value with its original concrete type.
+func RunOutputAs[T any](output *RunOutput) (T, bool) {
+	var zero T
+	if output == nil {
+		return zero, false
+	}
+	value, ok := output.Value.(T)
+	if !ok {
+		return zero, false
+	}
+	return value, true
+}
+
 // RunResult is the final value of one run's event stream.
 //
 // Model-side failures (vendor errors, aborts) live on Last.StopReason per
 // the ai layer contract. Err reports agent-level failures only: MaxTurns
-// exceeded, TransformContext errors, or a broken stream. NewMessages is
-// valid either way.
+// exceeded, TransformContext errors, an ambiguous terminal-tool batch, or a
+// broken stream. NewMessages is valid either way.
 type RunResult struct {
 	NewMessages []ai.Message
 	Last        *ai.AssistantMessage
-	Err         error
+	// Output is present only when a dedicated terminal tool successfully
+	// ended the run. Legacy ToolOutput.Terminate tools leave it nil.
+	Output *RunOutput
+	Err    error
 }

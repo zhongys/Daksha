@@ -153,7 +153,12 @@ func TestStreamerValidatesFragmentedFinalJSON(t *testing.T) {
 	stream := NewStreamer().Stream(context.Background(),
 		ai.Provider{BaseURL: server.URL + "/", APIKey: "k"}, ai.Model{ID: "m"},
 		ai.Prompt{Messages: []ai.Message{userText("hi")}},
-		ai.StreamOptions{OutputFormat: ai.OutputFormat{Type: ai.OutputFormatJSONObject}},
+		ai.StreamOptions{OutputFormat: ai.OutputFormat{
+			Type: ai.OutputFormatJSONSchema,
+			JSONSchema: &ai.JSONSchema{
+				Name: "answer", Schema: map[string]any{"type": "object"}, Strict: true,
+			},
+		}},
 	)
 	events, msg, err := collectStream(t, stream)
 	if err != nil {
@@ -161,10 +166,10 @@ func TestStreamerValidatesFragmentedFinalJSON(t *testing.T) {
 	}
 	wantTypes := []ai.AssistantMessageEventType{
 		ai.AssistantEventStart,
-		ai.AssistantEventTextStart,
-		ai.AssistantEventTextDelta,
-		ai.AssistantEventTextDelta,
-		ai.AssistantEventTextEnd,
+		ai.AssistantEventJSONStart,
+		ai.AssistantEventJSONDelta,
+		ai.AssistantEventJSONDelta,
+		ai.AssistantEventJSONEnd,
 		ai.AssistantEventDone,
 	}
 	if got := eventTypes(events); !reflect.DeepEqual(got, wantTypes) {
@@ -173,9 +178,34 @@ func TestStreamerValidatesFragmentedFinalJSON(t *testing.T) {
 	if msg.StopReason != ai.StopReasonStop {
 		t.Fatalf("StopReason = %s, error = %q", msg.StopReason, msg.ErrorMessage)
 	}
-	text := msg.Content[0].(*ai.TextContent).Text
-	if text != "  {\"answer\":\"Daksha\"} \n" || !json.Valid([]byte(text)) {
-		t.Fatalf("final text = %q", text)
+	structured := msg.Content[0].(*ai.JSONContent)
+	if structured.SchemaName != "answer" || string(structured.Value) != "  {\"answer\":\"Daksha\"} \n" || !json.Valid(structured.Value) {
+		t.Fatalf("final JSON = %#v", structured)
+	}
+	start := events[1].(ai.JSONStartEvent)
+	if value := start.Partial.Content[0].(*ai.JSONContent).Value; len(value) != 0 {
+		t.Fatalf("JSON start exposed unvalidated value %q", value)
+	}
+	for _, index := range []int{2, 3} {
+		delta := events[index].(ai.JSONDeltaEvent)
+		if value := delta.Partial.Content[0].(*ai.JSONContent).Value; len(value) != 0 {
+			t.Fatalf("JSON delta exposed unvalidated value %q", value)
+		}
+		if _, err := json.Marshal(delta); err != nil {
+			t.Fatalf("marshal JSON delta: %v", err)
+		}
+	}
+	end := events[4].(ai.JSONEndEvent)
+	if string(end.Content) != string(structured.Value) {
+		t.Fatalf("JSON end = %s, final = %s", end.Content, structured.Value)
+	}
+	end.Content[0] = '['
+	if end.Partial.Content[0].(*ai.JSONContent).Value[0] == '[' {
+		t.Fatal("JSONEnd.Content aliases JSONEnd.Partial.Value")
+	}
+	end.Partial.Content[0].(*ai.JSONContent).Value[1] = '['
+	if string(structured.Value) != "  {\"answer\":\"Daksha\"} \n" {
+		t.Fatalf("event RawMessage aliases final value: %s", structured.Value)
 	}
 }
 
@@ -236,7 +266,7 @@ func TestStreamerRejectsInvalidFinalJSON(t *testing.T) {
 				t.Fatalf("result = stop %s, error %q", msg.StopReason, msg.ErrorMessage)
 			}
 			for _, event := range events {
-				if event.EventType() == ai.AssistantEventDone || event.EventType() == ai.AssistantEventTextEnd {
+				if event.EventType() == ai.AssistantEventDone || event.EventType() == ai.AssistantEventJSONEnd {
 					t.Fatalf("invalid JSON published terminal success event %s", event.EventType())
 				}
 			}
@@ -244,8 +274,8 @@ func TestStreamerRejectsInvalidFinalJSON(t *testing.T) {
 				t.Fatalf("event sequence = %v", eventTypes(events))
 			}
 			if tt.content != "" {
-				text, ok := msg.Content[0].(*ai.TextContent)
-				if !ok || text.Text != tt.content {
+				structured, ok := msg.Content[0].(*ai.JSONContent)
+				if !ok || len(structured.Value) != 0 || msg.Diagnostics.Details["rawJSON"] != tt.content {
 					t.Fatalf("partial content = %#v, want %q", msg.Content, tt.content)
 				}
 			}
@@ -313,7 +343,7 @@ func TestSnapshotOutputFormatDetachesSchema(t *testing.T) {
 	}
 }
 
-func TestStreamerStructuredOutputSkipsJSONValidationForToolCallTurn(t *testing.T) {
+func TestStreamerStructuredOutputSkipsJSONValidationForToolCallOnlyTurn(t *testing.T) {
 	server := sseServer(t, []string{
 		`{"id":"r","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`,
 		`[DONE]`,
@@ -334,6 +364,38 @@ func TestStreamerStructuredOutputSkipsJSONValidationForToolCallTurn(t *testing.T
 	}
 	if events[len(events)-1].EventType() != ai.AssistantEventDone {
 		t.Fatalf("event sequence = %v", eventTypes(events))
+	}
+}
+
+func TestStreamerStructuredToolUseClosesEmittedJSON(t *testing.T) {
+	server := sseServer(t, []string{
+		sseTextChunk(t, `{"status":"working"}`, ""),
+		`{"id":"r","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`,
+		`[DONE]`,
+	})
+	defer server.Close()
+
+	stream := NewStreamer().Stream(context.Background(),
+		ai.Provider{BaseURL: server.URL + "/", APIKey: "k"}, ai.Model{ID: "m"},
+		ai.Prompt{Messages: []ai.Message{userText("hi")}},
+		ai.StreamOptions{OutputFormat: ai.OutputFormat{Type: ai.OutputFormatJSONObject}},
+	)
+	events, msg, err := collectStream(t, stream)
+	if err != nil {
+		t.Fatalf("Result: %v", err)
+	}
+	want := []ai.AssistantMessageEventType{
+		ai.AssistantEventStart,
+		ai.AssistantEventJSONStart, ai.AssistantEventJSONDelta,
+		ai.AssistantEventToolCallStart, ai.AssistantEventToolCallDelta,
+		ai.AssistantEventJSONEnd, ai.AssistantEventToolCallEnd,
+		ai.AssistantEventDone,
+	}
+	if got := eventTypes(events); !reflect.DeepEqual(got, want) {
+		t.Fatalf("event sequence = %v, want %v", got, want)
+	}
+	if msg.StopReason != ai.StopReasonToolUse || string(msg.Content[0].(*ai.JSONContent).Value) != `{"status":"working"}` {
+		t.Fatalf("message = %#v", msg)
 	}
 }
 
@@ -583,9 +645,17 @@ func TestStreamerMissingFinishReasonIsError(t *testing.T) {
 			OutputFormat: ai.OutputFormat{Type: ai.OutputFormatJSONObject},
 		})
 
-	_, msg, _ := collectStream(t, stream)
+	events, msg, _ := collectStream(t, stream)
 	if msg.StopReason != ai.StopReasonError || !strings.Contains(msg.ErrorMessage, "without finish_reason") {
 		t.Errorf("message = stop %v, error %q", msg.StopReason, msg.ErrorMessage)
+	}
+	if got := eventTypes(events); !reflect.DeepEqual(got, []ai.AssistantMessageEventType{
+		ai.AssistantEventStart, ai.AssistantEventJSONStart, ai.AssistantEventJSONDelta, ai.AssistantEventError,
+	}) {
+		t.Fatalf("event sequence = %v", got)
+	}
+	if msg.Diagnostics.Details["rawJSON"] != "x" {
+		t.Fatalf("raw JSON diagnostic = %#v", msg.Diagnostics.Details["rawJSON"])
 	}
 }
 
@@ -636,5 +706,32 @@ func TestStreamerErrorEventInStream(t *testing.T) {
 	// Partial content survives on the error message.
 	if text, ok := msg.Content[0].(*ai.TextContent); !ok || text.Text != "par" {
 		t.Errorf("content = %+v", msg.Content)
+	}
+}
+
+func TestStreamerStructuredErrorPreservesRawDelta(t *testing.T) {
+	server := sseServer(t, []string{
+		sseTextChunk(t, `{"answer":`, ""),
+		`{"error":{"message":"overloaded","type":"server_error"}}`,
+	})
+	defer server.Close()
+
+	stream := NewStreamer().Stream(context.Background(),
+		ai.Provider{BaseURL: server.URL + "/", APIKey: "k"}, ai.Model{ID: "m"},
+		ai.Prompt{Messages: []ai.Message{userText("hi")}}, ai.StreamOptions{
+			OutputFormat: ai.OutputFormat{Type: ai.OutputFormatJSONObject},
+		})
+	events, msg, err := collectStream(t, stream)
+	if err != nil {
+		t.Fatalf("Result: %v", err)
+	}
+	if got := eventTypes(events); !reflect.DeepEqual(got, []ai.AssistantMessageEventType{
+		ai.AssistantEventStart, ai.AssistantEventJSONStart, ai.AssistantEventJSONDelta, ai.AssistantEventError,
+	}) {
+		t.Fatalf("event sequence = %v", got)
+	}
+	structured, ok := msg.Content[0].(*ai.JSONContent)
+	if !ok || len(structured.Value) != 0 || msg.Diagnostics.Details["rawJSON"] != `{"answer":` {
+		t.Fatalf("structured error message = %#v", msg)
 	}
 }

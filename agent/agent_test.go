@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -19,6 +20,40 @@ type fakeLLM struct {
 	prompts []ai.Prompt
 	script  []*ai.AssistantMessage
 	block   chan struct{} // when set, responses wait for it (or ctx)
+}
+
+type jsonEventLLM struct {
+	raw json.RawMessage
+}
+
+func (f *jsonEventLLM) Stream(ctx context.Context, _, _ string, _ ai.Prompt,
+	_ ai.StreamOptions) *ai.EventStream[ai.AssistantMessageEvent, *ai.AssistantMessage] {
+	stream, producer := ai.NewEventStream[ai.AssistantMessageEvent, *ai.AssistantMessage](ctx, 8)
+	go func() {
+		placeholder := ai.AssistantMessage{
+			Role: ai.RoleAssistant,
+			Content: []ai.AssistantContent{&ai.JSONContent{
+				Type: ai.ContentTypeJSON, SchemaName: "answer",
+			}},
+		}
+		value := append(json.RawMessage(nil), f.raw...)
+		final := &ai.AssistantMessage{
+			Role: ai.RoleAssistant,
+			Content: []ai.AssistantContent{&ai.JSONContent{
+				Type: ai.ContentTypeJSON, SchemaName: "answer", Value: value,
+			}},
+			StopReason: ai.StopReasonStop,
+		}
+		_ = producer.Publish(ctx, ai.StartEvent{Partial: ai.AssistantMessage{Role: ai.RoleAssistant}})
+		_ = producer.Publish(ctx, ai.JSONStartEvent{ContentIndex: 0, Partial: placeholder})
+		_ = producer.Publish(ctx, ai.JSONDeltaEvent{ContentIndex: 0, Delta: string(f.raw), Partial: placeholder})
+		_ = producer.Publish(ctx, ai.JSONEndEvent{
+			ContentIndex: 0, Content: append(json.RawMessage(nil), f.raw...), Partial: *final,
+		})
+		_ = producer.Publish(ctx, ai.DoneEvent{Reason: ai.StopReasonStop, Message: *final})
+		_ = producer.Complete(ctx, final)
+	}()
+	return stream
 }
 
 func (f *fakeLLM) Stream(ctx context.Context, provider, model string, prompt ai.Prompt,
@@ -167,6 +202,42 @@ func TestPromptTextOnlyTurn(t *testing.T) {
 	}
 	if len(a.Messages()) != 2 {
 		t.Fatalf("context = %d messages", len(a.Messages()))
+	}
+}
+
+func TestAgentForwardsJSONEventsWithPartials(t *testing.T) {
+	llm := &jsonEventLLM{raw: json.RawMessage(`{"answer":"ok"}`)}
+	a := newAgent(t, Config{LLM: llm, Provider: "p", Model: "m"})
+
+	stream, err := a.PromptText(context.Background(), "structured please")
+	if err != nil {
+		t.Fatalf("PromptText: %v", err)
+	}
+	events, res, err := drainRun(t, stream)
+	if err != nil || res.Err != nil {
+		t.Fatalf("err=%v runErr=%v", err, res.Err)
+	}
+
+	var updates []MessageUpdateEvent
+	for _, event := range events {
+		if update, ok := event.(MessageUpdateEvent); ok {
+			updates = append(updates, update)
+		}
+	}
+	if len(updates) != 3 {
+		t.Fatalf("message updates = %d, want 3", len(updates))
+	}
+	want := []ai.AssistantMessageEventType{
+		ai.AssistantEventJSONStart, ai.AssistantEventJSONDelta, ai.AssistantEventJSONEnd,
+	}
+	for i, update := range updates {
+		if update.Message == nil || update.Inner.EventType() != want[i] {
+			t.Fatalf("update[%d] = %#v, want %s with non-nil partial", i, update, want[i])
+		}
+	}
+	structured, ok := res.Last.Content[0].(*ai.JSONContent)
+	if !ok || string(structured.Value) != `{"answer":"ok"}` {
+		t.Fatalf("final content = %#v", res.Last.Content)
 	}
 }
 
@@ -446,6 +517,123 @@ func TestTerminateSkipsFollowUpCall(t *testing.T) {
 	_, res, _ := drainRun(t, stream)
 	if res.Err != nil {
 		t.Fatalf("terminate is not an error: %v", res.Err)
+	}
+	if llm.callCount() != 1 {
+		t.Fatalf("LLM calls = %d, want 1", llm.callCount())
+	}
+	if res.Output != nil {
+		t.Fatalf("legacy Terminate tool produced run output: %#v", res.Output)
+	}
+}
+
+type finalAnswer struct {
+	Answer string `json:"answer"`
+	ID     int64  `json:"id"`
+}
+
+func terminalAnswerTool() Tool {
+	return NewTerminalTool[finalAnswer](ToolDefinition{ToolDefinition: ai.ToolDefinition{
+		Name:        "final_answer",
+		Description: "Submit the final structured answer",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"answer": map[string]any{"type": "string"},
+				"id":     map[string]any{"type": "integer"},
+			},
+			"required": []string{"answer", "id"},
+		},
+	}})
+}
+
+func TestTerminalToolReturnsTypedRunOutput(t *testing.T) {
+	llm := &fakeLLM{script: []*ai.AssistantMessage{
+		assistantToolCalls(toolCall("c1", "final_answer", map[string]any{
+			"answer": "done", "id": json.Number("9007199254740993"),
+		})),
+		assistantText("never reached"),
+	}}
+	a := newAgent(t, Config{
+		LLM: llm, Provider: "p", Model: "m", Tools: []Tool{terminalAnswerTool()},
+	})
+
+	stream, _ := a.PromptText(context.Background(), "finish")
+	events, res, err := drainRun(t, stream)
+	if err != nil || res.Err != nil {
+		t.Fatalf("err=%v runErr=%v", err, res.Err)
+	}
+	if llm.callCount() != 1 {
+		t.Fatalf("LLM calls = %d, want 1", llm.callCount())
+	}
+	if res.Output == nil || res.Output.ToolCallID != "c1" || res.Output.ToolName != "final_answer" {
+		t.Fatalf("RunResult.Output = %#v", res.Output)
+	}
+	value, ok := RunOutputAs[finalAnswer](res.Output)
+	if !ok || value.Answer != "done" || value.ID != 9_007_199_254_740_993 {
+		t.Fatalf("typed terminal value = %#v, ok=%v", value, ok)
+	}
+	result := res.NewMessages[2].(*ai.ToolResultMessage[any])
+	if result.Details == nil {
+		t.Fatal("terminal tool result did not persist details")
+	}
+	details, ok := (*result.Details).(finalAnswer)
+	if !ok || details != value {
+		t.Fatalf("tool result details = %#v, want %#v", result.Details, value)
+	}
+	var endOutput *RunOutput
+	for _, event := range events {
+		if end, ok := event.(AgentEndEvent); ok {
+			endOutput = end.Output
+		}
+	}
+	if endOutput != res.Output {
+		t.Fatalf("AgentEnd output = %#v, result output = %#v", endOutput, res.Output)
+	}
+}
+
+func TestTerminalToolOutputIgnoredWhenBatchContinues(t *testing.T) {
+	llm := &fakeLLM{script: []*ai.AssistantMessage{
+		assistantToolCalls(
+			toolCall("c1", "final_answer", map[string]any{"answer": "early", "id": 1}),
+			toolCall("c2", "echo", map[string]any{"text": "work"}),
+		),
+		assistantText("done after tools"),
+	}}
+	a := newAgent(t, Config{
+		LLM: llm, Provider: "p", Model: "m", Tools: []Tool{terminalAnswerTool(), echoTool()},
+	})
+
+	stream, _ := a.PromptText(context.Background(), "go")
+	_, res, _ := drainRun(t, stream)
+	if res.Err != nil {
+		t.Fatalf("mixed batch failed: %v", res.Err)
+	}
+	if llm.callCount() != 2 {
+		t.Fatalf("LLM calls = %d, want follow-up after mixed batch", llm.callCount())
+	}
+	if res.Output != nil {
+		t.Fatalf("non-terminating batch leaked terminal output: %#v", res.Output)
+	}
+}
+
+func TestMultipleTerminalOutputsFailDeterministically(t *testing.T) {
+	llm := &fakeLLM{script: []*ai.AssistantMessage{
+		assistantToolCalls(
+			toolCall("c1", "final_answer", map[string]any{"answer": "one", "id": 1}),
+			toolCall("c2", "final_answer", map[string]any{"answer": "two", "id": 2}),
+		),
+	}}
+	a := newAgent(t, Config{
+		LLM: llm, Provider: "p", Model: "m", Tools: []Tool{terminalAnswerTool()},
+	})
+
+	stream, _ := a.PromptText(context.Background(), "go")
+	_, res, _ := drainRun(t, stream)
+	if res.Err == nil || !strings.Contains(res.Err.Error(), "exactly one is allowed") {
+		t.Fatalf("RunResult.Err = %v", res.Err)
+	}
+	if res.Output != nil {
+		t.Fatalf("ambiguous terminal batch produced output: %#v", res.Output)
 	}
 	if llm.callCount() != 1 {
 		t.Fatalf("LLM calls = %d, want 1", llm.callCount())
