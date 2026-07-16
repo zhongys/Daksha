@@ -1,14 +1,36 @@
 package openai
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 )
+
+type httpDoerFunc func(*http.Request) (*http.Response, error)
+
+func (f httpDoerFunc) Do(req *http.Request) (*http.Response, error) { return f(req) }
+
+type trackingResponseBody struct {
+	reader io.Reader
+	closed bool
+}
+
+func (b *trackingResponseBody) Read(p []byte) (int, error) {
+	if b.reader == nil {
+		return 0, io.EOF
+	}
+	return b.reader.Read(p)
+}
+func (b *trackingResponseBody) Close() error {
+	b.closed = true
+	return nil
+}
 
 func TestExecuteJSONRequest(t *testing.T) {
 	type receivedRequest struct {
@@ -210,4 +232,290 @@ func TestExecuteHTTPError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected an error, got nil")
 	}
+}
+
+func TestExecuteRejectsNon2xxResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusMultipleChoices)
+		_, _ = w.Write([]byte(`{"error":{"message":"choose another endpoint","type":"redirect"}}`))
+	}))
+	defer server.Close()
+
+	var response map[string]any
+	err := ExecuteNewRequest(
+		context.Background(),
+		http.MethodGet,
+		"/redirected",
+		nil,
+		&response,
+		WithDefaultBaseURL(server.URL+"/"),
+	)
+	if err == nil {
+		t.Fatal("expected non-2xx response to return an error")
+	}
+	apiErr, ok := err.(*APIError)
+	if !ok {
+		t.Fatalf("error type = %T, want *APIError", err)
+	}
+	if apiErr.StatusCode != http.StatusMultipleChoices {
+		t.Fatalf("status = %d, want %d", apiErr.StatusCode, http.StatusMultipleChoices)
+	}
+}
+
+func TestExecuteClosesUnownedResponseBody(t *testing.T) {
+	body := &trackingResponseBody{}
+	err := ExecuteNewRequest(
+		context.Background(),
+		http.MethodGet,
+		"/ignored",
+		nil,
+		nil,
+		WithDefaultBaseURL("https://example.test/"),
+		WithHTTPClient(httpDoerFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusNoContent,
+				Header:     make(http.Header),
+				Body:       body,
+				Request:    req,
+			}, nil
+		})),
+	)
+	if err != nil {
+		t.Fatalf("ExecuteNewRequest: %v", err)
+	}
+	if !body.closed {
+		t.Fatal("unowned response body was not closed")
+	}
+}
+
+func TestExecuteLeavesRawResponseBodyWithItsOwner(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(t *testing.T, body *trackingResponseBody)
+	}{
+		{
+			name: "ResponseInto without decoded destination",
+			run: func(t *testing.T, body *trackingResponseBody) {
+				var raw *http.Response
+				err := ExecuteNewRequest(
+					context.Background(),
+					http.MethodGet,
+					"/raw",
+					nil,
+					nil,
+					WithResponseInto(&raw),
+					WithDefaultBaseURL("https://example.test/"),
+					WithHTTPClient(responseDoer(body)),
+				)
+				if err != nil {
+					t.Fatalf("ExecuteNewRequest: %v", err)
+				}
+				if raw == nil {
+					t.Fatal("ResponseInto was not populated")
+				}
+				if body.closed {
+					t.Fatal("Execute closed the body before its ResponseInto owner")
+				}
+				if err := raw.Body.Close(); err != nil {
+					t.Fatalf("closing owned body: %v", err)
+				}
+			},
+		},
+		{
+			name: "ResponseBodyInto raw response",
+			run: func(t *testing.T, body *trackingResponseBody) {
+				var raw *http.Response
+				err := ExecuteNewRequest(
+					context.Background(),
+					http.MethodGet,
+					"/raw",
+					nil,
+					&raw,
+					WithDefaultBaseURL("https://example.test/"),
+					WithHTTPClient(responseDoer(body)),
+				)
+				if err != nil {
+					t.Fatalf("ExecuteNewRequest: %v", err)
+				}
+				if raw == nil {
+					t.Fatal("raw response destination was not populated")
+				}
+				if body.closed {
+					t.Fatal("Execute closed the body before its raw-response owner")
+				}
+				if err := raw.Body.Close(); err != nil {
+					t.Fatalf("closing owned body: %v", err)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := &trackingResponseBody{}
+			tt.run(t, body)
+			if !body.closed {
+				t.Fatal("response owner could not close the body")
+			}
+		})
+	}
+}
+
+func TestExecuteConsumesBodyWhenResponseIntoOnlyObservesDecodedResponse(t *testing.T) {
+	body := &trackingResponseBody{reader: bytes.NewBufferString(`{"ok":true}`)}
+	var raw *http.Response
+	var decoded struct {
+		OK bool `json:"ok"`
+	}
+	err := ExecuteNewRequest(
+		context.Background(),
+		http.MethodGet,
+		"/decoded",
+		nil,
+		&decoded,
+		WithResponseInto(&raw),
+		WithDefaultBaseURL("https://example.test/"),
+		WithHTTPClient(httpDoerFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       body,
+				Request:    req,
+			}, nil
+		})),
+	)
+	if err != nil {
+		t.Fatalf("ExecuteNewRequest: %v", err)
+	}
+	if raw == nil {
+		t.Fatal("ResponseInto was not populated")
+	}
+	if !decoded.OK {
+		t.Fatal("decoded response was not populated")
+	}
+	if !body.closed {
+		t.Fatal("decoded response body was not closed")
+	}
+}
+
+func TestRequestConfigCloneWithBodyAndNilGetBody(t *testing.T) {
+	body := io.NopCloser(bytes.NewBufferString("request body"))
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, "https://example.test/", body)
+	if err != nil {
+		t.Fatalf("NewRequestWithContext: %v", err)
+	}
+	if req.GetBody != nil {
+		t.Fatal("test setup unexpectedly produced a GetBody function")
+	}
+
+	cfg := &RequestConfig{Request: req}
+	clone := cfg.Clone(context.Background())
+	if clone != nil {
+		t.Fatal("Clone returned a config for a request whose body cannot be replayed")
+	}
+}
+
+func TestExecuteClosesUnownedBodyOnEarlyErrors(t *testing.T) {
+	t.Run("request context canceled after response", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		body := &trackingResponseBody{}
+		err := ExecuteNewRequest(
+			ctx,
+			http.MethodGet,
+			"/canceled",
+			nil,
+			nil,
+			WithDefaultBaseURL("https://example.test/"),
+			WithHTTPClient(httpDoerFunc(func(req *http.Request) (*http.Response, error) {
+				cancel()
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       body,
+					Request:    req,
+				}, nil
+			})),
+		)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("ExecuteNewRequest error = %v, want context.Canceled", err)
+		}
+		if !body.closed {
+			t.Fatal("canceled request left its unowned response body open")
+		}
+	})
+
+	t.Run("response and transport error", func(t *testing.T) {
+		transportErr := errors.New("transport failed after response")
+		body := &trackingResponseBody{}
+		err := ExecuteNewRequest(
+			context.Background(),
+			http.MethodGet,
+			"/failed",
+			nil,
+			nil,
+			WithDefaultBaseURL("https://example.test/"),
+			WithHTTPClient(httpDoerFunc(func(req *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusBadGateway,
+					Header:     make(http.Header),
+					Body:       body,
+					Request:    req,
+				}, transportErr
+			})),
+		)
+		if !errors.Is(err, transportErr) {
+			t.Fatalf("ExecuteNewRequest error = %v, want transport error", err)
+		}
+		if !body.closed {
+			t.Fatal("transport error left its unowned response body open")
+		}
+	})
+}
+
+func TestExecuteTransfersEarlyErrorResponseToRawOwner(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	body := &trackingResponseBody{}
+	var raw *http.Response
+	err := ExecuteNewRequest(
+		ctx,
+		http.MethodGet,
+		"/canceled",
+		nil,
+		nil,
+		WithResponseInto(&raw),
+		WithDefaultBaseURL("https://example.test/"),
+		WithHTTPClient(httpDoerFunc(func(req *http.Request) (*http.Response, error) {
+			cancel()
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       body,
+				Request:    req,
+			}, nil
+		})),
+	)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("ExecuteNewRequest error = %v, want context.Canceled", err)
+	}
+	if raw == nil || raw.Body == nil {
+		t.Fatal("raw response owner was not populated on the early error path")
+	}
+	if body.closed {
+		t.Fatal("Execute closed a response body transferred to ResponseInto")
+	}
+	if err := raw.Body.Close(); err != nil {
+		t.Fatalf("closing owned response body: %v", err)
+	}
+}
+
+func responseDoer(body io.ReadCloser) HTTPDoer {
+	return httpDoerFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusNoContent,
+			Header:     make(http.Header),
+			Body:       body,
+			Request:    req,
+		}, nil
+	})
 }

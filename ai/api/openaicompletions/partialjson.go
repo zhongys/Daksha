@@ -2,6 +2,8 @@ package openaicompletions
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
 	"strings"
 )
 
@@ -16,8 +18,7 @@ func parseStreamingJSON(s string) map[string]any {
 	}
 
 	for _, candidate := range []string{s, repairJSON(s)} {
-		var strict map[string]any
-		if err := json.Unmarshal([]byte(candidate), &strict); err == nil {
+		if strict, err := decodeJSONObject(candidate); err == nil {
 			return strict
 		}
 	}
@@ -29,6 +30,32 @@ func parseStreamingJSON(s string) map[string]any {
 		}
 	}
 	return map[string]any{}
+}
+
+// decodeJSONObject performs a complete, non-lossy decode of one JSON object.
+// UseNumber is important for tool arguments: the default interface decoder
+// turns every number into float64, corrupting integers above 2^53 before the
+// typed tool adapter gets a chance to decode them. A second decode preserves
+// json.Unmarshal's strict rejection of trailing JSON values or garbage.
+func decodeJSONObject(s string) (map[string]any, error) {
+	decoder := json.NewDecoder(strings.NewReader(s))
+	decoder.UseNumber()
+
+	var object map[string]any
+	if err := decoder.Decode(&object); err != nil {
+		return nil, err
+	}
+	if object == nil {
+		return nil, errors.New("openai: tool arguments must be a JSON object")
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return nil, errors.New("openai: tool arguments contain multiple JSON values")
+		}
+		return nil, err
+	}
+	return object, nil
 }
 
 var validJSONEscapes = map[byte]bool{
@@ -412,9 +439,8 @@ func (p *partialParser) parseNumber() (any, error) {
 	// Trim trailing characters until the token parses (handles truncation
 	// like "12." or "1e" or "-").
 	for len(token) > 0 {
-		var num float64
-		if err := json.Unmarshal([]byte(token), &num); err == nil {
-			return num, nil
+		if json.Valid([]byte(token)) {
+			return json.Number(token), nil
 		}
 		token = token[:len(token)-1]
 	}

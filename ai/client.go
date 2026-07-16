@@ -1,7 +1,9 @@
 package ai
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"sort"
@@ -53,6 +55,12 @@ func (c *Client) PutProvider(p Provider) error {
 	if p.Name == "" {
 		return fmt.Errorf("ai: provider name is empty")
 	}
+	var err error
+	p.Extra, err = normalizeExtra(p.Extra)
+	if err != nil {
+		return fmt.Errorf("ai: provider %q extra: %w", p.Name, err)
+	}
+	p.Compat = cloneOpenAICompat(p.Compat)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.providers[p.Name] = p
@@ -73,7 +81,7 @@ func (c *Client) GetProvider(name string) (Provider, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	p, ok := c.providers[name]
-	return p, ok
+	return cloneProvider(p), ok
 }
 
 // ListProviders returns snapshots of all provider entries, sorted by name.
@@ -82,7 +90,7 @@ func (c *Client) ListProviders() []Provider {
 	defer c.mu.RUnlock()
 	out := make([]Provider, 0, len(c.providers))
 	for _, p := range c.providers {
-		out = append(out, p)
+		out = append(out, cloneProvider(p))
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
@@ -93,6 +101,11 @@ func (c *Client) ListProviders() []Provider {
 func (c *Client) PutModel(m Model) error {
 	if m.Provider == "" || m.ID == "" {
 		return fmt.Errorf("ai: model provider and id must both be set")
+	}
+	var err error
+	m.Extra, err = normalizeExtra(m.Extra)
+	if err != nil {
+		return fmt.Errorf("ai: model %q on provider %q extra: %w", m.ID, m.Provider, err)
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -117,7 +130,7 @@ func (c *Client) GetModel(providerName, modelID string) (Model, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	m, ok := c.models[providerName][modelID]
-	return m, ok
+	return cloneModel(m), ok
 }
 
 // ListModels returns snapshots of a provider's models, sorted by id.
@@ -127,7 +140,7 @@ func (c *Client) ListModels(providerName string) []Model {
 	byID := c.models[providerName]
 	out := make([]Model, 0, len(byID))
 	for _, m := range byID {
-		out = append(out, m)
+		out = append(out, cloneModel(m))
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
@@ -185,6 +198,8 @@ func (c *Client) resolveEntry(providerName, modelID string) (Provider, Model, er
 	c.mu.RLock()
 	provider, okP := c.providers[providerName]
 	model, okM := c.models[providerName][modelID]
+	provider = cloneProvider(provider)
+	model = cloneModel(model)
 	c.mu.RUnlock()
 
 	if !okP {
@@ -206,6 +221,90 @@ func (c *Client) resolveEntry(providerName, modelID string) (Provider, Model, er
 		provider.API = "openai-completions"
 	}
 	return provider, model, nil
+}
+
+// cloneProvider returns a detached provider value. Registry entries and
+// request snapshots must never share mutable configuration with their caller.
+func cloneProvider(provider Provider) Provider {
+	provider.Extra = cloneExtra(provider.Extra)
+	provider.Compat = cloneOpenAICompat(provider.Compat)
+	return provider
+}
+
+// cloneModel returns a detached model value for the same reason as
+// cloneProvider.
+func cloneModel(model Model) Model {
+	model.Extra = cloneExtra(model.Extra)
+	return model
+}
+
+func cloneOpenAICompat(compat *OpenAICompat) *OpenAICompat {
+	if compat == nil {
+		return nil
+	}
+	cloned := *compat
+	cloned.SupportsDeveloperRole = cloneBool(compat.SupportsDeveloperRole)
+	cloned.RequiresReasoningContentOnAssistantMessages = cloneBool(compat.RequiresReasoningContentOnAssistantMessages)
+	return &cloned
+}
+
+func cloneBool(value *bool) *bool {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
+}
+
+// normalizeExtra freezes arbitrary JSON-encodable input at registration time
+// into the same map/slice/scalar tree that will be sent on the wire. UseNumber
+// preserves large integers exactly. Concrete input types are intentionally not
+// retained: Extra is request JSON, and wire-equivalent immutable snapshots are
+// the registry contract.
+func normalizeExtra(extra map[string]any) (map[string]any, error) {
+	if extra == nil {
+		return nil, nil
+	}
+	encoded, err := json.Marshal(extra)
+	if err != nil {
+		return nil, err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	decoder.UseNumber()
+	var normalized map[string]any
+	if err := decoder.Decode(&normalized); err != nil {
+		return nil, err
+	}
+	return normalized, nil
+}
+
+// cloneExtra copies a normalized JSON tree. Registry entries only reach this
+// path after normalizeExtra succeeds, so Get/List/resolve cannot encounter an
+// unreportable cloning error.
+func cloneExtra(extra map[string]any) map[string]any {
+	if extra == nil {
+		return nil
+	}
+	cloned := make(map[string]any, len(extra))
+	for key, value := range extra {
+		cloned[key] = cloneExtraValue(value)
+	}
+	return cloned
+}
+
+func cloneExtraValue(value any) any {
+	switch value := value.(type) {
+	case map[string]any:
+		return cloneExtra(value)
+	case []any:
+		cloned := make([]any, len(value))
+		for i, item := range value {
+			cloned[i] = cloneExtraValue(item)
+		}
+		return cloned
+	default:
+		return value
+	}
 }
 
 // checkCapabilities enforces the model's content switches before dispatch.

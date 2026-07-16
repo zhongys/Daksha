@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -97,7 +98,9 @@ func (t *typedTool[P]) Execute(ctx context.Context, toolCallID string, args map[
 		return nil, fmt.Errorf("agent: encode arguments for tool %q: %w", t.def.Name, err)
 	}
 	var params P
-	if err := json.Unmarshal(raw, &params); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if err := decoder.Decode(&params); err != nil {
 		return nil, fmt.Errorf("agent: invalid arguments for tool %q: %w", t.def.Name, err)
 	}
 	return t.fn(ctx, toolCallID, params, onUpdate)

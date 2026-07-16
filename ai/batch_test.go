@@ -2,11 +2,32 @@ package ai
 
 import (
 	"context"
+	"math"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 )
+
+func TestCompleteBatchWorkerCountExtremeValues(t *testing.T) {
+	tests := []struct {
+		requests       int
+		maxConcurrency int
+		want           int
+	}{
+		{requests: 0, maxConcurrency: math.MaxInt, want: 0},
+		{requests: 5, maxConcurrency: math.MaxInt, want: 5},
+		{requests: math.MaxInt, maxConcurrency: 0, want: 1},
+		{requests: math.MaxInt, maxConcurrency: 7, want: 7},
+		{requests: math.MaxInt, maxConcurrency: math.MaxInt, want: maxCompleteBatchWorkers},
+	}
+	for _, tt := range tests {
+		if got := completeBatchWorkerCount(tt.requests, tt.maxConcurrency); got != tt.want {
+			t.Errorf("completeBatchWorkerCount(%d, %d) = %d, want %d",
+				tt.requests, tt.maxConcurrency, got, tt.want)
+		}
+	}
+}
 
 // countingStreamer tracks concurrent executions and echoes the model id.
 type countingStreamer struct {
@@ -127,5 +148,29 @@ func TestCompleteBatchIsolatesFailures(t *testing.T) {
 	}
 	if bad.Message.StopReason != StopReasonError || !strings.Contains(bad.Message.ErrorMessage, "unknown model") {
 		t.Fatalf("results[1] = %+v", bad.Message)
+	}
+}
+
+func TestCompleteBatchLargeInputUsesWorkerPool(t *testing.T) {
+	streamer := &countingStreamer{}
+	c := batchClient(streamer)
+	const requestCount = 10_000
+	reqs := make([]BatchRequest, requestCount)
+	for i := range reqs {
+		reqs[i] = BatchRequest{Provider: "acme", Model: "m0"}
+	}
+
+	results := c.CompleteBatch(context.Background(), reqs, 3)
+	if len(results) != requestCount {
+		t.Fatalf("results = %d, want %d", len(results), requestCount)
+	}
+	if got := streamer.total.Load(); got != requestCount {
+		t.Fatalf("completed = %d, want %d", got, requestCount)
+	}
+	streamer.mu.Lock()
+	peak := streamer.peak
+	streamer.mu.Unlock()
+	if peak > 3 {
+		t.Fatalf("peak concurrency = %d, want <= 3", peak)
 	}
 }

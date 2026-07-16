@@ -1,6 +1,7 @@
 package ai
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 )
@@ -174,10 +175,25 @@ func unmarshalAssistantContent(raw json.RawMessage) (AssistantContent, error) {
 	case ContentTypeThinking:
 		return decodeContent[ThinkingContent](raw)
 	case ContentTypeToolCall:
-		return decodeContent[ToolCallContent](raw)
+		return decodeToolCallContent(raw)
 	default:
 		return nil, fmt.Errorf("ai: unknown assistant content type %q", t)
 	}
+}
+
+// decodeToolCallContent is deliberately specialized: Arguments is an
+// interface-backed JSON tree whose numbers must remain exact. The default
+// decoder would turn them into float64 when restoring a persisted transcript,
+// corrupting integer tool arguments above 2^53. Other content decoders retain
+// their existing concrete-number behavior.
+func decodeToolCallContent(raw json.RawMessage) (*ToolCallContent, error) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var content ToolCallContent
+	if err := decoder.Decode(&content); err != nil {
+		return nil, err
+	}
+	return &content, nil
 }
 
 func unmarshalToolResultContent(raw json.RawMessage) (ToolResultContent, error) {

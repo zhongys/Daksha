@@ -63,6 +63,10 @@ type Config struct {
 // (single-flight — concurrent Prompt/Continue return ErrBusy).
 type Agent struct {
 	mu sync.RWMutex
+	// toolStartMu makes Abort and the final pre-Execute cancellation check a
+	// linearizable boundary. It is never held while a tool runs: handlers that
+	// already claimed a start still receive cancellation and can unwind.
+	toolStartMu sync.Mutex
 
 	llm           LLM
 	provider      string
@@ -83,6 +87,11 @@ type Agent struct {
 
 	running bool
 	cancel  context.CancelFunc
+	// activeRunID identifies the run that owns running/cancel. A completed
+	// run is retired before its result becomes observable; the identity keeps
+	// its deferred cleanup from clearing a newer run started in that window.
+	activeRunID uint64
+	nextRunID   uint64
 }
 
 func New(cfg Config) (*Agent, error) {
@@ -126,7 +135,7 @@ func (a *Agent) Prompt(ctx context.Context, msg *ai.UserMessage,
 	if msg == nil {
 		return nil, errors.New("agent: nil message")
 	}
-	return a.beginRun(ctx, []ai.Message{msg})
+	return a.beginRun(ctx, []ai.Message{msg}, false)
 }
 
 // PromptText is Prompt with a plain-text user message.
@@ -139,41 +148,68 @@ func (a *Agent) PromptText(ctx context.Context, text string,
 // the retry path after an error. The last message must be a user or
 // toolResult message.
 func (a *Agent) Continue(ctx context.Context) (*ai.EventStream[Event, *RunResult], error) {
-	a.mu.RLock()
-	var last ai.Message
-	if n := len(a.messages); n > 0 {
-		last = a.messages[n-1]
-	}
-	a.mu.RUnlock()
-
-	if last == nil {
-		return nil, errors.New("agent: cannot continue an empty context")
-	}
-	if _, isAssistant := last.(*ai.AssistantMessage); isAssistant {
-		return nil, errors.New("agent: cannot continue after an assistant message")
-	}
-	return a.beginRun(ctx, nil)
+	return a.beginRun(ctx, nil, true)
 }
 
-func (a *Agent) beginRun(ctx context.Context, initial []ai.Message,
+func (a *Agent) beginRun(ctx context.Context, initial []ai.Message, continuing bool,
 ) (*ai.EventStream[Event, *RunResult], error) {
 	if ctx == nil {
 		return nil, errors.New("agent: nil context")
 	}
 
+	// Construct the child context outside a.mu: a custom parent may run code
+	// from AfterFunc while WithCancel wires cancellation propagation.
+	runCtx, cancel := context.WithCancel(ctx)
+
 	a.mu.Lock()
 	if a.running {
 		a.mu.Unlock()
+		cancel()
 		return nil, ErrBusy
 	}
-	runCtx, cancel := context.WithCancel(ctx)
+	if continuing {
+		var last ai.Message
+		if n := len(a.messages); n > 0 {
+			last = a.messages[n-1]
+		}
+		if last == nil {
+			a.mu.Unlock()
+			cancel()
+			return nil, errors.New("agent: cannot continue an empty context")
+		}
+		if _, isAssistant := last.(*ai.AssistantMessage); isAssistant {
+			a.mu.Unlock()
+			cancel()
+			return nil, errors.New("agent: cannot continue after an assistant message")
+		}
+	}
+	a.nextRunID++
+	if a.nextRunID == 0 { // reserve zero for "no active run" after wraparound
+		a.nextRunID++
+	}
+	runID := a.nextRunID
 	a.running = true
 	a.cancel = cancel
+	a.activeRunID = runID
 	a.mu.Unlock()
 
 	stream, producer := ai.NewEventStream[Event, *RunResult](runCtx, 64)
-	go a.run(runCtx, producer, initial)
+	go a.run(runCtx, cancel, runID, producer, initial)
 	return stream, nil
+}
+
+// retireRun makes a run inactive only if it still owns the active slot.
+// It is deliberately idempotent: run calls it before publishing its result
+// and again from its defer for early exits or panics.
+func (a *Agent) retireRun(runID uint64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.activeRunID != runID {
+		return
+	}
+	a.running = false
+	a.cancel = nil
+	a.activeRunID = 0
 }
 
 // Steer queues a user message for injection after the current tool batch
@@ -214,15 +250,31 @@ func (a *Agent) ClearFollowUp() {
 	a.followUp = nil
 }
 
-// Abort cancels the current run, if any. The run winds down through the
-// normal event flow (aborted stop reason or RunResult.Err).
+// Abort cancels the current run, if any, and establishes a hard tool-start
+// barrier: after it returns, no tool which had not already claimed its start
+// may enter Execute. Already-started tools receive the canceled context and
+// are allowed to unwind normally.
 func (a *Agent) Abort() {
+	// Serialize cancellation with the final tool-start claim. Once Abort
+	// returns, no not-yet-claimed handler can enter Execute.
+	a.toolStartMu.Lock()
 	a.mu.Lock()
 	cancel := a.cancel
 	a.mu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
+	a.toolStartMu.Unlock()
+}
+
+// claimToolStart is the last gate before invoking Tool.Execute. Returning
+// true means the call was dispatched before any concurrent Abort boundary;
+// the mutex is deliberately released before Execute so Abort can cancel an
+// already-running handler instead of waiting for it.
+func (a *Agent) claimToolStart(ctx context.Context) bool {
+	a.toolStartMu.Lock()
+	defer a.toolStartMu.Unlock()
+	return ctx.Err() == nil
 }
 
 // Reset clears the context and both queues. Fails while a run is active.

@@ -123,6 +123,155 @@ func TestStreamerFullTurn(t *testing.T) {
 	}
 }
 
+func TestStreamerPartialsAreEventTimeSnapshots(t *testing.T) {
+	server := sseServer(t, []string{
+		`{"id":"r","choices":[{"index":0,"delta":{"reasoning_content":"think"}}]}`,
+		`{"id":"r","choices":[{"index":0,"delta":{"reasoning_content":" more"}}]}`,
+		`{"id":"r","choices":[{"index":0,"delta":{"content":"hel"}}]}`,
+		`{"id":"r","choices":[{"index":0,"delta":{"content":"lo"}}]}`,
+		`{"id":"r","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"inspect","arguments":"{\"config\":{\"path\":\"/tmp"}}]}}]}`,
+		`{"id":"r","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"/x\"}}"}}]},"finish_reason":"tool_calls"}]}`,
+		`[DONE]`,
+	})
+	defer server.Close()
+
+	stream := NewStreamer().Stream(context.Background(),
+		ai.Provider{BaseURL: server.URL + "/", APIKey: "k"}, ai.Model{ID: "m"},
+		ai.Prompt{Messages: []ai.Message{userText("hi")}}, ai.StreamOptions{})
+	events, msg, err := collectStream(t, stream)
+	if err != nil {
+		t.Fatalf("Result: %v", err)
+	}
+
+	var thinkingStart ai.ThinkingStartEvent
+	var thinkingDeltas []ai.ThinkingDeltaEvent
+	var textStart ai.TextStartEvent
+	var textDeltas []ai.TextDeltaEvent
+	var toolStart ai.ToolCallStartEvent
+	var toolDeltas []ai.ToolCallDeltaEvent
+	for _, event := range events {
+		switch event := event.(type) {
+		case ai.ThinkingStartEvent:
+			thinkingStart = event
+		case ai.ThinkingDeltaEvent:
+			thinkingDeltas = append(thinkingDeltas, event)
+		case ai.TextStartEvent:
+			textStart = event
+		case ai.TextDeltaEvent:
+			textDeltas = append(textDeltas, event)
+		case ai.ToolCallStartEvent:
+			toolStart = event
+		case ai.ToolCallDeltaEvent:
+			toolDeltas = append(toolDeltas, event)
+		}
+	}
+
+	thinkingAt := func(partial ai.AssistantMessage, index int) string {
+		t.Helper()
+		content, ok := partial.Content[index].(*ai.ThinkingContent)
+		if !ok {
+			t.Fatalf("content[%d] = %T, want *ai.ThinkingContent", index, partial.Content[index])
+		}
+		return content.Thinking
+	}
+	textAt := func(partial ai.AssistantMessage, index int) string {
+		t.Helper()
+		content, ok := partial.Content[index].(*ai.TextContent)
+		if !ok {
+			t.Fatalf("content[%d] = %T, want *ai.TextContent", index, partial.Content[index])
+		}
+		return content.Text
+	}
+	toolConfigAt := func(partial ai.AssistantMessage, index int) map[string]any {
+		t.Helper()
+		content, ok := partial.Content[index].(*ai.ToolCallContent)
+		if !ok {
+			t.Fatalf("content[%d] = %T, want *ai.ToolCallContent", index, partial.Content[index])
+		}
+		config, ok := content.Arguments["config"].(map[string]any)
+		if !ok {
+			t.Fatalf("tool arguments = %#v, want nested config", content.Arguments)
+		}
+		return config
+	}
+
+	if len(thinkingDeltas) != 2 || len(textDeltas) != 2 || len(toolDeltas) != 2 {
+		t.Fatalf("delta counts: thinking=%d text=%d tool=%d", len(thinkingDeltas), len(textDeltas), len(toolDeltas))
+	}
+	if got := thinkingAt(thinkingStart.Partial, thinkingStart.ContentIndex); got != "" {
+		t.Errorf("thinking start snapshot = %q, want empty", got)
+	}
+	if got := thinkingAt(thinkingDeltas[0].Partial, thinkingDeltas[0].ContentIndex); got != "think" {
+		t.Errorf("first thinking snapshot = %q, want %q", got, "think")
+	}
+	if got := thinkingAt(thinkingDeltas[1].Partial, thinkingDeltas[1].ContentIndex); got != "think more" {
+		t.Errorf("second thinking snapshot = %q, want %q", got, "think more")
+	}
+	if got := textAt(textStart.Partial, textStart.ContentIndex); got != "" {
+		t.Errorf("text start snapshot = %q, want empty", got)
+	}
+	if got := textAt(textDeltas[0].Partial, textDeltas[0].ContentIndex); got != "hel" {
+		t.Errorf("first text snapshot = %q, want %q", got, "hel")
+	}
+	if got := textAt(textDeltas[1].Partial, textDeltas[1].ContentIndex); got != "hello" {
+		t.Errorf("second text snapshot = %q, want %q", got, "hello")
+	}
+	if args := toolStart.Partial.Content[toolStart.ContentIndex].(*ai.ToolCallContent).Arguments; len(args) != 0 {
+		t.Errorf("tool start arguments = %#v, want empty", args)
+	}
+	if got := toolConfigAt(toolDeltas[0].Partial, toolDeltas[0].ContentIndex)["path"]; got != "/tmp" {
+		t.Errorf("first tool snapshot path = %#v, want %q", got, "/tmp")
+	}
+	if got := toolConfigAt(toolDeltas[1].Partial, toolDeltas[1].ContentIndex)["path"]; got != "/tmp/x" {
+		t.Errorf("second tool snapshot path = %#v, want %q", got, "/tmp/x")
+	}
+
+	// Nested JSON values must not alias later event snapshots or the result.
+	toolConfigAt(toolDeltas[0].Partial, toolDeltas[0].ContentIndex)["path"] = "changed"
+	if got := toolConfigAt(toolDeltas[1].Partial, toolDeltas[1].ContentIndex)["path"]; got != "/tmp/x" {
+		t.Errorf("mutating first snapshot changed second snapshot to %#v", got)
+	}
+	finalConfig := msg.Content[2].(*ai.ToolCallContent).Arguments["config"].(map[string]any)
+	if got := finalConfig["path"]; got != "/tmp/x" {
+		t.Errorf("mutating event snapshot changed final result to %#v", got)
+	}
+}
+
+func TestStreamerToolContinuationWithIDOmittedIndexRoutesByID(t *testing.T) {
+	server := sseServer(t, []string{
+		`{"id":"r","choices":[{"index":0,"delta":{"tool_calls":[` +
+			`{"index":0,"id":"call_a","function":{"name":"tool_a","arguments":"{\"value\":\""}}]}}]}`,
+		// call_b first appears with an ID but no index. The omitted index
+		// decodes to zero, which is already occupied by call_a.
+		`{"id":"r","choices":[{"index":0,"delta":{"tool_calls":[` +
+			`{"id":"call_b","function":{"name":"tool_b","arguments":"{\"value\":\"B\"}"}}]}}]}`,
+		// Verify the ID conflict did not overwrite index zero's mapping.
+		`{"id":"r","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"A\"}"}}]},"finish_reason":"tool_calls"}]}`,
+		`[DONE]`,
+	})
+	defer server.Close()
+
+	stream := NewStreamer().Stream(context.Background(),
+		ai.Provider{BaseURL: server.URL + "/", APIKey: "k"}, ai.Model{ID: "m"},
+		ai.Prompt{Messages: []ai.Message{userText("hi")}}, ai.StreamOptions{})
+	_, msg, err := collectStream(t, stream)
+	if err != nil {
+		t.Fatalf("Result: %v", err)
+	}
+	if len(msg.Content) != 2 {
+		t.Fatalf("content blocks = %d, want 2", len(msg.Content))
+	}
+
+	callA := msg.Content[0].(*ai.ToolCallContent)
+	callB := msg.Content[1].(*ai.ToolCallContent)
+	if callA.Id != "call_a" || callA.Name != "tool_a" || callA.Arguments["value"] != "A" {
+		t.Errorf("call A = %#v", callA)
+	}
+	if callB.Id != "call_b" || callB.Name != "tool_b" || callB.Arguments["value"] != "B" {
+		t.Errorf("call B = %#v", callB)
+	}
+}
+
 func TestStreamerReasoningFieldFallback(t *testing.T) {
 	// OpenRouter-style `reasoning` field; signature must record the source.
 	server := sseServer(t, []string{

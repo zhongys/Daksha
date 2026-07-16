@@ -150,9 +150,14 @@ type ThinkingContent struct {
 }
 
 type ToolCallContent struct {
-	Type             ContentType    `json:"type"`
-	Id               string         `json:"id"`
-	Name             string         `json:"name"`
+	Type ContentType `json:"type"`
+	Id   string      `json:"id"`
+	Name string      `json:"name"`
+	// Arguments is a decoded JSON object. Numeric values from protocol
+	// adapters and persisted transcripts are encoding/json.Number, including
+	// values nested in maps and slices, so raw Tool implementations must not
+	// assume float64. Typed tools JSON-decode these values into their declared
+	// parameter types.
 	Arguments        map[string]any `json:"arguments"`
 	ThoughtSignature string         `json:"thoughtSignature,omitempty"`
 }

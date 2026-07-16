@@ -23,7 +23,9 @@ type Provider struct {
 	// auto-detection from BaseURL.
 	Compat *OpenAICompat
 	// Extra carries provider-specific request fields merged into the
-	// top-level request JSON, e.g. Qwen's enable_thinking.
+	// top-level request JSON, e.g. Qwen's enable_thinking. Client.PutProvider
+	// snapshots values by their JSON representation; Get/List therefore return
+	// JSON tree types rather than preserving caller-specific concrete Go types.
 	Extra map[string]any
 }
 

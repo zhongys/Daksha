@@ -99,3 +99,46 @@ func TestUnmarshalMessageErrors(t *testing.T) {
 		t.Error("bad JSON should fail")
 	}
 }
+
+func TestUnmarshalAssistantToolArgumentsPreservesLargeIntegers(t *testing.T) {
+	original := &AssistantMessage{
+		Role: RoleAssistant,
+		Content: []AssistantContent{&ToolCallContent{
+			Type: ContentTypeToolCall,
+			Id:   "call_1",
+			Name: "lookup",
+			Arguments: map[string]any{
+				"id": int64(9_007_199_254_740_993),
+				"nested": map[string]any{
+					"values": []any{uint64(9_007_199_254_740_995)},
+				},
+			},
+		}},
+	}
+
+	wire, err := json.Marshal(original)
+	if err != nil {
+		t.Fatalf("marshal assistant message: %v", err)
+	}
+	decodedMessage, err := UnmarshalMessage(wire)
+	if err != nil {
+		t.Fatalf("UnmarshalMessage: %v", err)
+	}
+	call := decodedMessage.(*AssistantMessage).Content[0].(*ToolCallContent)
+	if got, ok := call.Arguments["id"].(json.Number); !ok || got.String() != "9007199254740993" {
+		t.Fatalf("id = %T(%v), want exact json.Number", call.Arguments["id"], call.Arguments["id"])
+	}
+	nested := call.Arguments["nested"].(map[string]any)
+	value := nested["values"].([]any)[0]
+	if got, ok := value.(json.Number); !ok || got.String() != "9007199254740995" {
+		t.Fatalf("nested value = %T(%v), want exact json.Number", value, value)
+	}
+
+	reencoded, err := json.Marshal(decodedMessage)
+	if err != nil {
+		t.Fatalf("re-marshal assistant message: %v", err)
+	}
+	if !reflect.DeepEqual(wire, reencoded) {
+		t.Fatalf("assistant message round trip drifted:\n first = %s\nsecond = %s", wire, reencoded)
+	}
+}

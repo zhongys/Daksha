@@ -85,12 +85,19 @@ func (e *emitter) announce(m ai.Message) bool {
 	return e.publish(MessageStartEvent{Message: m}) && e.publish(MessageEndEvent{Message: m})
 }
 
-func (a *Agent) run(ctx context.Context, producer *ai.Producer[Event, *RunResult], initial []ai.Message) {
+func (e *emitter) failure() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.err
+}
+
+func (a *Agent) run(ctx context.Context, cancel context.CancelFunc, runID uint64,
+	producer *ai.Producer[Event, *RunResult], initial []ai.Message) {
 	defer func() {
-		a.mu.Lock()
-		a.running = false
-		a.cancel = nil
-		a.mu.Unlock()
+		// Always release the context's parent linkage. retireRun is guarded by
+		// run identity so this cleanup cannot overwrite a newer run.
+		a.retireRun(runID)
+		cancel()
 	}()
 
 	em := &emitter{ctx: ctx, producer: producer}
@@ -202,6 +209,10 @@ func (a *Agent) run(ctx context.Context, producer *ai.Producer[Event, *RunResult
 		runErr = em.err
 	}
 	em.publish(AgentEndEvent{NewMessages: newMessages})
+	// Result() must imply that the agent is ready for its next run. Retire
+	// before Complete makes the result visible; the run identity protects a
+	// new run from the deferred cleanup above.
+	a.retireRun(runID)
 	_ = producer.Complete(ctx, &RunResult{NewMessages: newMessages, Last: last, Err: runErr})
 }
 
@@ -210,16 +221,18 @@ type toolOutcome struct {
 	call      *ai.ToolCallContent
 	msg       *ai.ToolResultMessage[any]
 	terminate bool
-	// executed marks outcomes that ran (vs blocked/unknown), used only to
-	// decide which entries still need running.
+	// pending marks outcomes whose permission checks passed and whose handler
+	// has not yet been finalized.
 	pending bool
 }
 
-// executeTools runs the tool calls of one assistant message. Preflight
-// (start events + BeforeToolCall) is always sequential in source order;
-// execution honors the batch mode; tool_execution_end fires per completion;
-// toolResult messages are recorded in assistant source order. Returns the
-// recorded messages and whether every result asked to terminate.
+// executeTools runs the tool calls of one assistant message. Permission
+// checks are always sequential in source order; execution honors the batch
+// mode; tool_execution_end fires per completion; toolResult messages are
+// recorded in assistant source order. Cancellation is a hard start barrier:
+// a call which has not reached Execute is finalized as canceled, and neither
+// its permission hook nor handler is invoked. Already-running handlers still
+// get their canceled context and are allowed to unwind normally.
 func (a *Agent) executeTools(ctx context.Context, em *emitter, cfg runConfig,
 	final *ai.AssistantMessage) ([]ai.Message, bool) {
 
@@ -245,35 +258,90 @@ func (a *Agent) executeTools(ctx context.Context, em *emitter, cfg runConfig,
 		}
 	}
 
-	// Preflight in source order.
 	outcomes := make([]*toolOutcome, len(calls))
 	for i, call := range calls {
-		em.publish(ToolExecutionStartEvent{ToolCallID: call.Id, ToolName: call.Name, Args: call.Arguments})
-		o := &toolOutcome{call: call}
-		outcomes[i] = o
+		outcomes[i] = &toolOutcome{call: call}
+	}
 
-		tool, known := byName[call.Name]
-		switch {
-		case !known:
-			o.msg = errorResult(call, fmt.Errorf("agent: unknown tool %q", call.Name))
-		case a.beforeToolCall != nil:
-			if err := a.beforeToolCall(ctx, *call); err != nil {
-				o.msg = errorResult(call, fmt.Errorf("agent: tool call blocked: %w", err))
+	stopError := func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return em.failure()
+	}
+	finalizeSkipped := func(o *toolOutcome, err error) {
+		if o.msg != nil {
+			return
+		}
+		if err == nil {
+			err = context.Canceled
+		}
+		o.msg = errorResult(o.call, fmt.Errorf("agent: tool call canceled before execution: %w", err))
+		o.pending = false
+	}
+	preflight := func(o *toolOutcome) bool {
+		if err := stopError(); err != nil {
+			finalizeSkipped(o, err)
+			return false
+		}
+		if !em.publish(ToolExecutionStartEvent{
+			ToolCallID: o.call.Id, ToolName: o.call.Name, Args: o.call.Arguments,
+		}) {
+			finalizeSkipped(o, stopError())
+			return false
+		}
+
+		if _, known := byName[o.call.Name]; !known {
+			o.msg = errorResult(o.call, fmt.Errorf("agent: unknown tool %q", o.call.Name))
+			em.publish(ToolExecutionEndEvent{
+				ToolCallID: o.call.Id, ToolName: o.call.Name, Result: o.msg, IsError: true,
+			})
+			return false
+		}
+		if a.beforeToolCall != nil {
+			// Cancellation can land after the start event or while the hook is
+			// running. In either case it wins over permission success/failure and
+			// prevents the handler (and every later hook) from starting.
+			if err := stopError(); err != nil {
+				finalizeSkipped(o, err)
+				return false
+			}
+			err := a.beforeToolCall(ctx, *o.call)
+			if stopErr := stopError(); stopErr != nil {
+				finalizeSkipped(o, stopErr)
+				return false
+			}
+			if err != nil {
+				o.msg = errorResult(o.call, fmt.Errorf("agent: tool call blocked: %w", err))
+				em.publish(ToolExecutionEndEvent{
+					ToolCallID: o.call.Id, ToolName: o.call.Name, Result: o.msg, IsError: true,
+				})
+				return false
 			}
 		}
-		if o.msg != nil {
-			em.publish(ToolExecutionEndEvent{ToolCallID: call.Id, ToolName: call.Name, Result: o.msg, IsError: true})
-			continue
-		}
 		o.pending = true
-		_ = tool // executed below
+		return true
 	}
 
 	execute := func(o *toolOutcome) {
+		if err := stopError(); err != nil {
+			finalizeSkipped(o, err)
+			return
+		}
 		tool := byName[o.call.Name]
 		onUpdate := func(u ToolUpdate) {
+			// Updates racing with Abort are discarded. The handler has already
+			// started and may still return its final result while unwinding.
+			if ctx.Err() != nil {
+				return
+			}
 			em.publish(ToolExecutionUpdateEvent{ToolCallID: o.call.Id, ToolName: o.call.Name, Update: u})
 		}
+		if !a.claimToolStart(ctx) {
+			finalizeSkipped(o, ctx.Err())
+			return
+		}
+		o.pending = false
 		out, err := tool.Execute(ctx, o.call.Id, o.call.Arguments, onUpdate)
 		if err != nil {
 			o.msg = errorResult(o.call, err)
@@ -288,11 +356,18 @@ func (a *Agent) executeTools(ctx context.Context, em *emitter, cfg runConfig,
 
 	if sequential {
 		for _, o := range outcomes {
+			preflight(o)
 			if o.pending {
 				execute(o)
 			}
 		}
 	} else {
+		// Parallel calls are permission-checked serially. Once cancellation is
+		// observed, remaining hooks are skipped; accepted calls still re-check
+		// immediately inside their goroutine before entering Execute.
+		for _, o := range outcomes {
+			preflight(o)
+		}
 		var wg sync.WaitGroup
 		for _, o := range outcomes {
 			if !o.pending {
@@ -305,6 +380,15 @@ func (a *Agent) executeTools(ctx context.Context, em *emitter, cfg runConfig,
 			}(o)
 		}
 		wg.Wait()
+	}
+
+	// Any calls after the cancellation boundary were deliberately untouched
+	// by preflight. Give each one an error result without starting a hook or a
+	// handler, keeping the persisted protocol history structurally complete.
+	for _, o := range outcomes {
+		if o.msg == nil {
+			finalizeSkipped(o, stopError())
+		}
 	}
 
 	// Record in assistant source order regardless of completion order.

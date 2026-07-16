@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -78,7 +79,7 @@ func (s *Streamer) run(ctx context.Context, producer *ai.Producer[ai.AssistantMe
 		return
 	}
 
-	if producer.Publish(ctx, ai.StartEvent{Partial: *msg}) != nil {
+	if producer.Publish(ctx, ai.StartEvent{Partial: snapshotAssistantMessage(msg)}) != nil {
 		return
 	}
 
@@ -128,6 +129,9 @@ func (s *Streamer) run(ctx context.Context, producer *ai.Producer[ai.AssistantMe
 		return
 	}
 	if err := acc.finishAll(ctx); err != nil {
+		if ctx.Err() == nil {
+			fail(ctx, producer, msg, err)
+		}
 		return
 	}
 	if ctx.Err() != nil {
@@ -143,7 +147,7 @@ func (s *Streamer) run(ctx context.Context, producer *ai.Producer[ai.AssistantMe
 		return
 	}
 
-	if producer.Publish(ctx, ai.DoneEvent{Reason: msg.StopReason, Message: *msg}) != nil {
+	if producer.Publish(ctx, ai.DoneEvent{Reason: msg.StopReason, Message: snapshotAssistantMessage(msg)}) != nil {
 		return
 	}
 	_ = producer.Complete(ctx, msg)
@@ -160,7 +164,7 @@ func fail(ctx context.Context, producer *ai.Producer[ai.AssistantMessageEvent, *
 	if msg.ErrorMessage == "" || msg.StopReason == ai.StopReasonAborted {
 		msg.ErrorMessage = err.Error()
 	}
-	_ = producer.Publish(ctx, ai.ErrorEvent{Reason: msg.StopReason, Error: *msg})
+	_ = producer.Publish(ctx, ai.ErrorEvent{Reason: msg.StopReason, Error: snapshotAssistantMessage(msg)})
 	_ = producer.Complete(ctx, msg)
 }
 
@@ -189,19 +193,81 @@ type toolCallState struct {
 	partialArgs strings.Builder
 }
 
+// snapshotAssistantMessage returns an event-time snapshot. AssistantMessage
+// contains interface slices, pointer-backed content blocks and JSON maps, so a
+// plain struct copy would let later deltas rewrite already-published events.
+func snapshotAssistantMessage(msg *ai.AssistantMessage) ai.AssistantMessage {
+	snapshot := *msg
+	if msg.Content != nil {
+		snapshot.Content = make([]ai.AssistantContent, len(msg.Content))
+		for i, content := range msg.Content {
+			switch content := content.(type) {
+			case *ai.TextContent:
+				if content != nil {
+					copy := *content
+					snapshot.Content[i] = &copy
+				}
+			case *ai.ThinkingContent:
+				if content != nil {
+					copy := *content
+					snapshot.Content[i] = &copy
+				}
+			case *ai.ToolCallContent:
+				if content != nil {
+					copy := *content
+					copy.Arguments = cloneJSONMap(content.Arguments)
+					snapshot.Content[i] = &copy
+				}
+			default:
+				snapshot.Content[i] = content
+			}
+		}
+	}
+	snapshot.Diagnostics.Details = cloneJSONMap(msg.Diagnostics.Details)
+	return snapshot
+}
+
+func cloneJSONMap(src map[string]any) map[string]any {
+	if src == nil {
+		return nil
+	}
+	dst := make(map[string]any, len(src))
+	for key, value := range src {
+		dst[key] = cloneJSONValue(value)
+	}
+	return dst
+}
+
+func cloneJSONValue(value any) any {
+	switch value := value.(type) {
+	case map[string]any:
+		return cloneJSONMap(value)
+	case []any:
+		copy := make([]any, len(value))
+		for i, item := range value {
+			copy[i] = cloneJSONValue(item)
+		}
+		return copy
+	default:
+		return value
+	}
+}
+
 func (a *accumulator) applyDelta(ctx context.Context, delta openai.ChatCompletionChunkChoiceDelta) error {
 	if delta.Content != "" {
 		if a.text == nil {
 			a.text = &ai.TextContent{Type: ai.ContentTypeText}
 			a.textIdx = len(a.msg.Content)
 			a.msg.Content = append(a.msg.Content, a.text)
-			if err := a.producer.Publish(ctx, ai.TextStartEvent{ContentIndex: a.textIdx, Partial: *a.msg}); err != nil {
+			if err := a.producer.Publish(ctx, ai.TextStartEvent{
+				ContentIndex: a.textIdx, Partial: snapshotAssistantMessage(a.msg),
+			}); err != nil {
 				return err
 			}
 		}
 		a.text.Text += delta.Content
 		if err := a.producer.Publish(ctx, ai.TextDeltaEvent{
-			ContentIndex: a.textIdx, Delta: delta.Content, Partial: *a.msg,
+			ContentIndex: a.textIdx, Delta: delta.Content, Partial: snapshotAssistantMessage(a.msg),
 		}); err != nil {
 			return err
 		}
@@ -223,13 +289,15 @@ func (a *accumulator) applyDelta(ctx context.Context, delta openai.ChatCompletio
 			a.thinking = &ai.ThinkingContent{Type: ai.ContentTypeThinking, ThinkingSignature: reasoningField}
 			a.thinkingIdx = len(a.msg.Content)
 			a.msg.Content = append(a.msg.Content, a.thinking)
-			if err := a.producer.Publish(ctx, ai.ThinkingStartEvent{ContentIndex: a.thinkingIdx, Partial: *a.msg}); err != nil {
+			if err := a.producer.Publish(ctx, ai.ThinkingStartEvent{
+				ContentIndex: a.thinkingIdx, Partial: snapshotAssistantMessage(a.msg),
+			}); err != nil {
 				return err
 			}
 		}
 		a.thinking.Thinking += reasoningDelta
 		if err := a.producer.Publish(ctx, ai.ThinkingDeltaEvent{
-			ContentIndex: a.thinkingIdx, Delta: reasoningDelta, Partial: *a.msg,
+			ContentIndex: a.thinkingIdx, Delta: reasoningDelta, Partial: snapshotAssistantMessage(a.msg),
 		}); err != nil {
 			return err
 		}
@@ -254,7 +322,7 @@ func (a *accumulator) applyDelta(ctx context.Context, delta openai.ChatCompletio
 			state.block.Arguments = parseStreamingJSON(state.partialArgs.String())
 		}
 		if err := a.producer.Publish(ctx, ai.ToolCallDeltaEvent{
-			ContentIndex: state.contentIdx, Delta: tc.Function.Arguments, Partial: *a.msg,
+			ContentIndex: state.contentIdx, Delta: tc.Function.Arguments, Partial: snapshotAssistantMessage(a.msg),
 		}); err != nil {
 			return err
 		}
@@ -268,17 +336,32 @@ func (a *accumulator) ensureToolCall(ctx context.Context, tc openai.ChatCompleti
 		a.toolByID = map[string]*toolCallState{}
 	}
 
+	// An omitted index decodes to zero, which may already belong to another
+	// tool. A supplied ID is therefore the authoritative continuation key.
+	if tc.ID != "" {
+		if state, ok := a.toolByID[tc.ID]; ok {
+			return state, nil
+		}
+		if state, ok := a.toolByIndex[tc.Index]; ok {
+			// Some providers reveal the ID after starting the call by index.
+			if state.block.Id == "" || state.block.Id == tc.ID {
+				return state, nil
+			}
+			// A new ID that conflicts with an occupied/defaulted index is a
+			// distinct call. Do not replace the index mapping: later index-only
+			// fragments must continue to reach the original call.
+			return a.startToolCall(ctx, tc, false)
+		}
+	}
 	if state, ok := a.toolByIndex[tc.Index]; ok {
 		return state, nil
 	}
-	// Fallback for providers that omit the index on continuation deltas.
-	if tc.ID != "" {
-		if state, ok := a.toolByID[tc.ID]; ok {
-			a.toolByIndex[tc.Index] = state
-			return state, nil
-		}
-	}
+	return a.startToolCall(ctx, tc, true)
+}
 
+func (a *accumulator) startToolCall(ctx context.Context,
+	tc openai.ChatCompletionChunkChoiceDeltaToolCall, mapIndex bool,
+) (*toolCallState, error) {
 	state := &toolCallState{
 		block: &ai.ToolCallContent{
 			Type:      ai.ContentTypeToolCall,
@@ -290,34 +373,52 @@ func (a *accumulator) ensureToolCall(ctx context.Context, tc openai.ChatCompleti
 	}
 	a.msg.Content = append(a.msg.Content, state.block)
 	a.toolOrder = append(a.toolOrder, state)
-	a.toolByIndex[tc.Index] = state
+	if mapIndex {
+		a.toolByIndex[tc.Index] = state
+	}
 	if tc.ID != "" {
 		a.toolByID[tc.ID] = state
 	}
-	return state, a.producer.Publish(ctx, ai.ToolCallStartEvent{ContentIndex: state.contentIdx, Partial: *a.msg})
+	return state, a.producer.Publish(ctx, ai.ToolCallStartEvent{
+		ContentIndex: state.contentIdx, Partial: snapshotAssistantMessage(a.msg),
+	})
 }
 
 // finishAll closes every open block in content order, emitting the matching
-// end events. Tool call arguments get one final parse of the full buffer.
+// end events. Partial argument parsing is for UI updates only: the complete
+// buffer must be one strict JSON object before any tool-call end event (and
+// therefore before the agent can execute it) becomes observable.
 func (a *accumulator) finishAll(ctx context.Context) error {
+	for _, state := range a.toolOrder {
+		arguments, err := decodeJSONObject(state.partialArgs.String())
+		if err != nil {
+			return fmt.Errorf(
+				"openai: invalid final JSON arguments for tool %q (call %q): %w",
+				state.block.Name, state.block.Id, err,
+			)
+		}
+		state.block.Arguments = arguments
+	}
+
 	if a.text != nil {
 		if err := a.producer.Publish(ctx, ai.TextEndEvent{
-			ContentIndex: a.textIdx, Content: a.text.Text, Partial: *a.msg,
+			ContentIndex: a.textIdx, Content: a.text.Text, Partial: snapshotAssistantMessage(a.msg),
 		}); err != nil {
 			return err
 		}
 	}
 	if a.thinking != nil {
 		if err := a.producer.Publish(ctx, ai.ThinkingEndEvent{
-			ContentIndex: a.thinkingIdx, Content: a.thinking.Thinking, Partial: *a.msg,
+			ContentIndex: a.thinkingIdx, Content: a.thinking.Thinking, Partial: snapshotAssistantMessage(a.msg),
 		}); err != nil {
 			return err
 		}
 	}
 	for _, state := range a.toolOrder {
-		state.block.Arguments = parseStreamingJSON(state.partialArgs.String())
+		toolCall := *state.block
+		toolCall.Arguments = cloneJSONMap(state.block.Arguments)
 		if err := a.producer.Publish(ctx, ai.ToolCallEndEvent{
-			ContentIndex: state.contentIdx, ToolCall: *state.block, Partial: *a.msg,
+			ContentIndex: state.contentIdx, ToolCall: toolCall, Partial: snapshotAssistantMessage(a.msg),
 		}); err != nil {
 			return err
 		}

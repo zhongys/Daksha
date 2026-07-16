@@ -265,12 +265,21 @@ func TestUnknownToolIsError(t *testing.T) {
 
 func TestParallelExecutionOrdering(t *testing.T) {
 	bDone := make(chan struct{})
+	releaseA := make(chan struct{})
 	slowA := NewTool(ToolDefinition{ToolDefinition: ai.ToolDefinition{Name: "a"}},
 		func(ctx context.Context, id string, _ struct{}, _ func(ToolUpdate)) (*ToolOutput, error) {
 			select {
 			case <-bDone: // finish only after b — forces reverse completion order
 			case <-time.After(5 * time.Second):
 				return nil, errors.New("deadlock: batch did not run in parallel")
+			}
+			// Tool B closes bDone from a defer just before Execute returns. Wait
+			// until B's end event is actually observed so scheduler timing cannot
+			// let A publish its end event first.
+			select {
+			case <-releaseA:
+			case <-time.After(5 * time.Second):
+				return nil, errors.New("deadlock: b completion event was not consumed")
 			}
 			return &ToolOutput{}, nil
 		})
@@ -290,7 +299,17 @@ func TestParallelExecutionOrdering(t *testing.T) {
 	})
 
 	stream, _ := a.PromptText(context.Background(), "go")
-	events, res, _ := drainRun(t, stream)
+	var events []Event
+	for event := range stream.Events() {
+		events = append(events, event)
+		if end, ok := event.(ToolExecutionEndEvent); ok && end.ToolName == "b" {
+			close(releaseA)
+		}
+	}
+	res, err := stream.Result(context.Background())
+	if err != nil {
+		t.Fatalf("Result: %v", err)
+	}
 	if res.Err != nil {
 		t.Fatalf("run failed: %v", res.Err)
 	}

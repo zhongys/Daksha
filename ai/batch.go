@@ -5,6 +5,12 @@ import (
 	"sync"
 )
 
+// maxCompleteBatchWorkers is a defensive implementation ceiling, not a
+// caller-visible concurrency promise. CompleteBatch guarantees an upper bound;
+// using fewer workers than an extreme request preserves that contract while
+// preventing unbounded goroutine creation.
+const maxCompleteBatchWorkers = 1024
+
 // BatchRequest is one independent turn in a CompleteBatch call.
 type BatchRequest struct {
 	Provider string
@@ -29,26 +35,49 @@ type BatchResult struct {
 // This is the sanctioned entry point for fan-out workloads (e.g. splitting
 // a large extraction across parallel model calls): the bound is the rate
 // discipline, and future controls (global limits, retries, cost budgets)
-// belong here. maxConcurrency values below 1 are treated as 1.
+// belong here. maxConcurrency values below 1 are treated as 1; values above
+// maxCompleteBatchWorkers are safely capped.
 func (c *Client) CompleteBatch(ctx context.Context, reqs []BatchRequest, maxConcurrency int,
 ) []BatchResult {
+	results := make([]BatchResult, len(reqs))
+	workerCount := completeBatchWorkerCount(len(reqs), maxConcurrency)
+	if workerCount == 0 {
+		return results
+	}
+
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	wg.Add(workerCount)
+	for range workerCount {
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				req := reqs[i]
+				msg, err := c.Complete(ctx, req.Provider, req.Model, req.Prompt, req.Options)
+				results[i] = BatchResult{Message: msg, Err: err}
+			}
+		}()
+	}
+	for i := range reqs {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+	return results
+}
+
+func completeBatchWorkerCount(requestCount, maxConcurrency int) int {
+	if requestCount <= 0 {
+		return 0
+	}
 	if maxConcurrency < 1 {
 		maxConcurrency = 1
 	}
-	results := make([]BatchResult, len(reqs))
-	sem := make(chan struct{}, maxConcurrency)
-	var wg sync.WaitGroup
-
-	for i, req := range reqs {
-		wg.Add(1)
-		go func(i int, req BatchRequest) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			msg, err := c.Complete(ctx, req.Provider, req.Model, req.Prompt, req.Options)
-			results[i] = BatchResult{Message: msg, Err: err}
-		}(i, req)
+	if maxConcurrency > requestCount {
+		maxConcurrency = requestCount
 	}
-	wg.Wait()
-	return results
+	if maxConcurrency > maxCompleteBatchWorkers {
+		maxConcurrency = maxCompleteBatchWorkers
+	}
+	return maxConcurrency
 }

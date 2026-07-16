@@ -136,6 +136,23 @@ type RequestConfig struct {
 	Body         io.Reader
 }
 
+// cancelOnCloseBody keeps a request-scoped timeout alive while a caller owns
+// a streaming response body, then releases its context resources with the
+// body. A raw *http.Response must outlive Execute, so Execute cannot defer the
+// timeout's cancel function in that case.
+type cancelOnCloseBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b *cancelOnCloseBody) Close() error {
+	// Cancel first so a custom response body whose Close waits on the request
+	// context cannot deadlock waiting for the cancellation it is meant to
+	// trigger.
+	b.cancel()
+	return b.ReadCloser.Close()
+}
+
 func (cfg *RequestConfig) Execute() (err error) {
 	if cfg.BaseURL == nil {
 		if cfg.DefaultBaseURL != nil {
@@ -179,36 +196,52 @@ func (cfg *RequestConfig) Execute() (err error) {
 	}
 
 	ctx := cfg.Request.Context()
+	var cancel context.CancelFunc
 	if cfg.RequestTimeout > 0 {
-		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, cfg.RequestTimeout)
-		defer cancel()
+		defer func() {
+			if cancel != nil {
+				cancel()
+			}
+		}()
 	}
 	req := cfg.Request.Clone(ctx)
 
 	var res *http.Response
 	res, err = handler(req)
-	if ctx != nil && ctx.Err() != nil {
-		return ctx.Err()
-	}
 
 	// Save *http.Response if it is requested to, even if there was an error making the request. This is
 	// useful in cases where you might want to debug by inspecting the response. Note that if err != nil,
 	// the response should be generally be empty, but there are edge cases.
+	responseBodyInto, intoCustomResponseBody := cfg.ResponseBodyInto.(**http.Response)
 	if cfg.ResponseInto != nil {
 		*cfg.ResponseInto = res
 	}
-	if responseBodyInto, ok := cfg.ResponseBodyInto.(**http.Response); ok {
+	if intoCustomResponseBody {
 		*responseBodyInto = res
+	}
+	closeUnownedResponse := func() {
+		if res == nil || res.Body == nil {
+			return
+		}
+		if cfg.ResponseInto == nil && !intoCustomResponseBody {
+			_ = res.Body.Close()
+		}
+	}
+
+	if ctx != nil && ctx.Err() != nil {
+		closeUnownedResponse()
+		return ctx.Err()
 	}
 
 	// If there was a connection error in the final request or any other transport error,
 	// return that early without trying to coerce into an APIError.
 	if err != nil {
+		closeUnownedResponse()
 		return err
 	}
 
-	if res.StatusCode >= 400 {
+	if res.StatusCode < http.StatusOK || res.StatusCode >= http.StatusMultipleChoices {
 		contents, err := io.ReadAll(res.Body)
 		_ = res.Body.Close()
 		if err != nil {
@@ -222,8 +255,20 @@ func (cfg *RequestConfig) Execute() (err error) {
 		return ParseAPIError(res.StatusCode, contents)
 	}
 
-	_, intoCustomResponseBody := cfg.ResponseBodyInto.(**http.Response)
-	if cfg.ResponseBodyInto == nil || intoCustomResponseBody {
+	responseBodyHasOwner := intoCustomResponseBody || (cfg.ResponseBodyInto == nil && cfg.ResponseInto != nil)
+	if responseBodyHasOwner && cancel != nil && res.Body != nil {
+		res.Body = &cancelOnCloseBody{ReadCloser: res.Body, cancel: cancel}
+		cancel = nil // ownership moves to res.Body.Close
+	}
+	if cfg.ResponseBodyInto == nil {
+		if cfg.ResponseInto == nil && res.Body != nil {
+			// No decoded destination and no raw-response owner: release the
+			// connection here instead of returning an unreachable body.
+			_ = res.Body.Close()
+		}
+		return nil
+	}
+	if intoCustomResponseBody {
 		// We aren't reading the response body in this scope, but whoever is will need the
 		// cancel func from the context to observe request timeouts.
 		return nil
@@ -283,6 +328,9 @@ func (cfg *RequestConfig) Clone(ctx context.Context) *RequestConfig {
 	req := cfg.Request.Clone(ctx)
 	var err error
 	if req.Body != nil {
+		if req.GetBody == nil {
+			return nil
+		}
 		req.Body, err = req.GetBody()
 	}
 	if err != nil {

@@ -63,6 +63,13 @@ func (s *eventStreamDecoder) Next() bool {
 
 		// Dispatch event on an empty line
 		if len(txt) == 0 {
+			// SSE comments and empty blocks do not dispatch events. Reset the
+			// event name so a comment-only heartbeat cannot leak state into the
+			// next data block.
+			if data.Len() == 0 {
+				event = ""
+				continue
+			}
 			s.evt = Event{
 				Type: event,
 				Data: data.Bytes(),

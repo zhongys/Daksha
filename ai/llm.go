@@ -66,6 +66,8 @@ type Model struct {
 	MaxOutputTokens int64
 
 	// Extra carries model-level request fields merged into every request.
+	// Client.PutModel snapshots values by their JSON representation; Get/List
+	// return JSON tree types rather than caller-specific concrete Go types.
 	Extra map[string]any
 }
 
