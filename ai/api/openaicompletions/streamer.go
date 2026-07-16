@@ -1,6 +1,7 @@
 package openaicompletions
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -39,12 +40,14 @@ func NewStreamer(opts ...openai.RequestOption) *Streamer {
 func (s *Streamer) Stream(ctx context.Context, provider ai.Provider, model ai.Model, prompt ai.Prompt, opts ai.StreamOptions,
 ) *ai.EventStream[ai.AssistantMessageEvent, *ai.AssistantMessage] {
 	stream, producer := ai.NewEventStream[ai.AssistantMessageEvent, *ai.AssistantMessage](ctx, 64)
-	go s.run(ctx, producer, provider, model, prompt, opts)
+	outputFormat, outputFormatErr := snapshotOutputFormat(opts.OutputFormat)
+	opts.OutputFormat = outputFormat
+	go s.run(ctx, producer, provider, model, prompt, opts, outputFormatErr)
 	return stream
 }
 
 func (s *Streamer) run(ctx context.Context, producer *ai.Producer[ai.AssistantMessageEvent, *ai.AssistantMessage],
-	provider ai.Provider, model ai.Model, prompt ai.Prompt, opts ai.StreamOptions) {
+	provider ai.Provider, model ai.Model, prompt ai.Prompt, opts ai.StreamOptions, outputFormatErr error) {
 
 	msg := &ai.AssistantMessage{
 		Role:       ai.RoleAssistant,
@@ -56,6 +59,10 @@ func (s *Streamer) run(ctx context.Context, producer *ai.Producer[ai.AssistantMe
 	}
 	if msg.Provider == "" {
 		msg.Provider = provider.Name
+	}
+	if outputFormatErr != nil {
+		fail(ctx, producer, msg, outputFormatErr)
+		return
 	}
 
 	params, err := buildParams(provider, model, prompt, opts)
@@ -83,7 +90,7 @@ func (s *Streamer) run(ctx context.Context, producer *ai.Producer[ai.AssistantMe
 		return
 	}
 
-	acc := &accumulator{msg: msg, producer: producer}
+	acc := &accumulator{msg: msg, producer: producer, outputFormat: opts.OutputFormat}
 	hasFinishReason := false
 
 	for sse.Next() {
@@ -128,7 +135,7 @@ func (s *Streamer) run(ctx context.Context, producer *ai.Producer[ai.AssistantMe
 		fail(ctx, producer, msg, err)
 		return
 	}
-	if err := acc.finishAll(ctx); err != nil {
+	if err := acc.finishAll(ctx, hasFinishReason); err != nil {
 		if ctx.Err() == nil {
 			fail(ctx, producer, msg, err)
 		}
@@ -174,13 +181,15 @@ func fail(ctx context.Context, producer *ai.Producer[ai.AssistantMessageEvent, *
 // fallback for providers that omit the index, and all blocks close together
 // when the stream ends.
 type accumulator struct {
-	msg      *ai.AssistantMessage
-	producer *ai.Producer[ai.AssistantMessageEvent, *ai.AssistantMessage]
+	msg          *ai.AssistantMessage
+	producer     *ai.Producer[ai.AssistantMessageEvent, *ai.AssistantMessage]
+	outputFormat ai.OutputFormat
 
 	text        *ai.TextContent
 	textIdx     int
 	thinking    *ai.ThinkingContent
 	thinkingIdx int
+	refusal     strings.Builder
 
 	toolOrder   []*toolCallState
 	toolByIndex map[int64]*toolCallState
@@ -253,7 +262,41 @@ func cloneJSONValue(value any) any {
 	}
 }
 
+// snapshotOutputFormat validates and freezes the schema before Stream returns;
+// the request goroutine must not retain caller-owned maps that can be mutated
+// while it validates or marshals the request.
+func snapshotOutputFormat(format ai.OutputFormat) (ai.OutputFormat, error) {
+	if err := format.Validate(); err != nil {
+		return format, err
+	}
+	if format.JSONSchema == nil {
+		return format, nil
+	}
+
+	schema := *format.JSONSchema
+	encoded, err := json.Marshal(schema.Schema)
+	if err != nil {
+		return format, fmt.Errorf("openai: snapshot output schema: %w", err)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	decoder.UseNumber()
+	var clonedSchema map[string]any
+	if err := decoder.Decode(&clonedSchema); err != nil {
+		return format, fmt.Errorf("openai: snapshot output schema: %w", err)
+	}
+	schema.Schema = clonedSchema
+	format.JSONSchema = &schema
+	return format, nil
+}
+
 func (a *accumulator) applyDelta(ctx context.Context, delta openai.ChatCompletionChunkChoiceDelta) error {
+	if delta.Refusal != "" {
+		a.refusal.WriteString(delta.Refusal)
+		if a.msg.Diagnostics.Details == nil {
+			a.msg.Diagnostics.Details = map[string]any{}
+		}
+		a.msg.Diagnostics.Details["refusal"] = a.refusal.String()
+	}
 	if delta.Content != "" {
 		if a.text == nil {
 			a.text = &ai.TextContent{Type: ai.ContentTypeText}
@@ -384,11 +427,11 @@ func (a *accumulator) startToolCall(ctx context.Context,
 	})
 }
 
-// finishAll closes every open block in content order, emitting the matching
-// end events. Partial argument parsing is for UI updates only: the complete
-// buffer must be one strict JSON object before any tool-call end event (and
-// therefore before the agent can execute it) becomes observable.
-func (a *accumulator) finishAll(ctx context.Context) error {
+// finishAll validates completed tool arguments and structured final text before
+// closing open blocks in content order. Partial JSON is for UI updates only: no
+// terminal success event becomes observable until the relevant final buffers
+// satisfy their contracts.
+func (a *accumulator) finishAll(ctx context.Context, validateFinalOutput bool) error {
 	for _, state := range a.toolOrder {
 		arguments, err := decodeJSONObject(state.partialArgs.String())
 		if err != nil {
@@ -398,6 +441,11 @@ func (a *accumulator) finishAll(ctx context.Context) error {
 			)
 		}
 		state.block.Arguments = arguments
+	}
+	if validateFinalOutput {
+		if err := a.validateFinalJSON(); err != nil {
+			return err
+		}
 	}
 
 	if a.text != nil {
@@ -422,6 +470,36 @@ func (a *accumulator) finishAll(ctx context.Context) error {
 		}); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// validateFinalJSON runs only for a final assistant answer. A tool-call turn is
+// an intermediate agent step and may legitimately contain no JSON text even
+// when the eventual answer has a structured output contract.
+func (a *accumulator) validateFinalJSON() error {
+	if !a.outputFormat.IsJSON() || a.msg.StopReason == ai.StopReasonToolUse || a.msg.StopReason == ai.StopReasonError {
+		return nil
+	}
+	if refusal := a.refusal.String(); refusal != "" {
+		return fmt.Errorf("openai: structured output refused: %s", refusal)
+	}
+	if a.text == nil || strings.TrimSpace(a.text.Text) == "" {
+		return fmt.Errorf("openai: output format %q produced no JSON content", a.outputFormat.Type)
+	}
+	if a.outputFormat.Type == ai.OutputFormatJSONObject {
+		var object map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(a.text.Text), &object); err != nil {
+			return fmt.Errorf("openai: invalid final JSON object for output format %q: %w", a.outputFormat.Type, err)
+		}
+		if object == nil {
+			return fmt.Errorf("openai: invalid final JSON object for output format %q: top-level value is null", a.outputFormat.Type)
+		}
+		return nil
+	}
+	var value json.RawMessage
+	if err := json.Unmarshal([]byte(a.text.Text), &value); err != nil {
+		return fmt.Errorf("openai: invalid final JSON for output format %q: %w", a.outputFormat.Type, err)
 	}
 	return nil
 }

@@ -2,6 +2,7 @@ package openaicompletions
 
 import (
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -148,6 +149,130 @@ func TestBuildParamsExtraPrecedence(t *testing.T) {
 		if !strings.Contains(got, w) {
 			t.Errorf("missing %q in %s", w, got)
 		}
+	}
+}
+
+func TestBuildParamsOutputFormat(t *testing.T) {
+	prompt := ai.Prompt{Messages: []ai.Message{userText("hi")}}
+	tests := []struct {
+		name   string
+		format ai.OutputFormat
+		want   map[string]any
+	}{
+		{name: "provider default omits field"},
+		{
+			name:   "text",
+			format: ai.OutputFormat{Type: ai.OutputFormatText},
+			want:   map[string]any{"type": "text"},
+		},
+		{
+			name:   "json object",
+			format: ai.OutputFormat{Type: ai.OutputFormatJSONObject},
+			want:   map[string]any{"type": "json_object"},
+		},
+		{
+			name: "json schema",
+			format: ai.OutputFormat{
+				Type: ai.OutputFormatJSONSchema,
+				JSONSchema: &ai.JSONSchema{
+					Name:        "answer",
+					Description: "A concise answer",
+					Schema: map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"answer": map[string]any{"type": "string"},
+						},
+					},
+					Strict: true,
+				},
+			},
+			want: map[string]any{
+				"type": "json_schema",
+				"json_schema": map[string]any{
+					"name":        "answer",
+					"description": "A concise answer",
+					"schema": map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"answer": map[string]any{"type": "string"},
+						},
+					},
+					"strict": true,
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			params, err := buildParams(ai.Provider{}, ai.Model{ID: "m"}, prompt, ai.StreamOptions{
+				OutputFormat: tt.format,
+			})
+			if err != nil {
+				t.Fatalf("buildParams: %v", err)
+			}
+			var body map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(marshalParams(t, params)), &body); err != nil {
+				t.Fatalf("unmarshal request: %v", err)
+			}
+			raw, ok := body["response_format"]
+			if tt.want == nil {
+				if ok {
+					t.Fatalf("response_format = %s, want omitted", raw)
+				}
+				return
+			}
+			if !ok {
+				t.Fatal("response_format is missing")
+			}
+			var got map[string]any
+			if err := json.Unmarshal(raw, &got); err != nil {
+				t.Fatalf("unmarshal response_format: %v", err)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("response_format = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBuildParamsOutputFormatRejectsExtraCollision(t *testing.T) {
+	prompt := ai.Prompt{Messages: []ai.Message{userText("hi")}}
+	legacy := map[string]any{"response_format": map[string]any{"type": "json_object"}}
+	tests := []struct {
+		name     string
+		provider ai.Provider
+		model    ai.Model
+		opts     ai.StreamOptions
+	}{
+		{name: "provider", provider: ai.Provider{Extra: legacy}},
+		{name: "model", model: ai.Model{Extra: legacy}},
+		{name: "request", opts: ai.StreamOptions{Extra: legacy}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.model.ID = "m"
+			tt.opts.OutputFormat = ai.OutputFormat{Type: ai.OutputFormatJSONObject}
+			_, err := buildParams(tt.provider, tt.model, prompt, tt.opts)
+			if err == nil || !strings.Contains(err.Error(), "cannot be set through Extra") {
+				t.Fatalf("buildParams error = %v", err)
+			}
+		})
+	}
+}
+
+func TestBuildParamsLegacyExtraResponseFormatStillWorks(t *testing.T) {
+	params, err := buildParams(ai.Provider{}, ai.Model{ID: "m"}, ai.Prompt{
+		Messages: []ai.Message{userText("hi")},
+	}, ai.StreamOptions{Extra: map[string]any{
+		"response_format": map[string]any{"type": "json_object"},
+	}})
+	if err != nil {
+		t.Fatalf("buildParams: %v", err)
+	}
+	if got := marshalParams(t, params); !strings.Contains(got, `"response_format":{"type":"json_object"}`) {
+		t.Fatalf("request = %s", got)
 	}
 }
 

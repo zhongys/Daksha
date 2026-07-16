@@ -73,6 +73,9 @@ func resolveCompat(provider ai.Provider) resolvedCompat {
 
 func buildParams(provider ai.Provider, model ai.Model, prompt ai.Prompt, opts ai.StreamOptions) (openai.ChatCompletionNewParams, error) {
 	compat := resolveCompat(provider)
+	if err := opts.OutputFormat.Validate(); err != nil {
+		return openai.ChatCompletionNewParams{}, err
+	}
 
 	messages, err := convertMessages(prompt, model, compat)
 	if err != nil {
@@ -103,6 +106,9 @@ func buildParams(provider ai.Provider, model ai.Model, prompt ai.Prompt, opts ai
 	if opts.ToolChoice != "" {
 		params.ToolChoice = openai.ChatCompletionToolChoiceOptionUnionParam{OfAuto: openai.String(opts.ToolChoice)}
 	}
+	if err := applyOutputFormat(&params, opts.OutputFormat); err != nil {
+		return openai.ChatCompletionNewParams{}, err
+	}
 
 	for _, tool := range prompt.Tools {
 		params.Tools = append(params.Tools, openai.ChatCompletionFunctionTool(openai.FunctionDefinitionParam{
@@ -115,13 +121,49 @@ func buildParams(provider ai.Provider, model ai.Model, prompt ai.Prompt, opts ai
 	applyThinkingFormat(&params, model, compat, opts.ReasoningEffort)
 
 	// Precedence: provider < model < request; explicit extras win over
-	// everything, including the thinking-format fields above.
+	// everything, including the thinking-format fields above. response_format
+	// remains available through Extra for compatibility only when the typed
+	// OutputFormat is unset; mixing both forms is rejected.
 	for _, extra := range []map[string]any{provider.Extra, model.Extra, opts.Extra} {
 		for k, v := range extra {
+			if k == "response_format" && opts.OutputFormat.Type != "" {
+				return openai.ChatCompletionNewParams{}, fmt.Errorf(
+					"openai: response_format cannot be set through Extra when OutputFormat is set",
+				)
+			}
 			params.ExtraFields[k] = v
 		}
 	}
 	return params, nil
+}
+
+func applyOutputFormat(params *openai.ChatCompletionNewParams, format ai.OutputFormat) error {
+	switch format.Type {
+	case "":
+		return nil
+	case ai.OutputFormatText:
+		params.ResponseFormat = openai.ResponseFormatText()
+	case ai.OutputFormatJSONObject:
+		params.ResponseFormat = openai.ResponseFormatJSONObject()
+	case ai.OutputFormatJSONSchema:
+		schema := format.JSONSchema
+		if schema == nil {
+			// buildParams validates first; keep this helper safe in isolation.
+			return fmt.Errorf("openai: output format %q requires a json schema", format.Type)
+		}
+		wireSchema := openai.ResponseFormatJSONSchemaJSONSchemaParam{
+			Name:   schema.Name,
+			Schema: schema.Schema,
+			Strict: openai.Bool(schema.Strict),
+		}
+		if schema.Description != "" {
+			wireSchema.Description = openai.String(schema.Description)
+		}
+		params.ResponseFormat = openai.ResponseFormatJSONSchema(wireSchema)
+	default:
+		return fmt.Errorf("openai: unsupported output format %q", format.Type)
+	}
+	return nil
 }
 
 func applyThinkingFormat(params *openai.ChatCompletionNewParams, model ai.Model, compat resolvedCompat, effort string) {

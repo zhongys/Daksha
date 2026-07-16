@@ -2,10 +2,12 @@ package openaicompletions
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/zhongys/Daksha/ai"
@@ -39,6 +41,23 @@ func eventTypes(events []ai.AssistantMessageEvent) []ai.AssistantMessageEventTyp
 		types = append(types, ev.EventType())
 	}
 	return types
+}
+
+func sseTextChunk(t *testing.T, content, finishReason string) string {
+	t.Helper()
+	choice := map[string]any{
+		"index": 0,
+		"delta": map[string]any{"content": content},
+	}
+	if finishReason != "" {
+		choice["finish_reason"] = finishReason
+	}
+	chunk := map[string]any{"id": "r", "choices": []any{choice}}
+	encoded, err := json.Marshal(chunk)
+	if err != nil {
+		t.Fatalf("marshal SSE chunk: %v", err)
+	}
+	return string(encoded)
 }
 
 func TestStreamerFullTurn(t *testing.T) {
@@ -120,6 +139,238 @@ func TestStreamerFullTurn(t *testing.T) {
 	wantUsage := ai.Usage{Input: 40, Output: 20, CacheRead: 60, Reasoning: 5, TotalTokens: 120}
 	if msg.Usage != wantUsage {
 		t.Errorf("usage = %+v, want %+v", msg.Usage, wantUsage)
+	}
+}
+
+func TestStreamerValidatesFragmentedFinalJSON(t *testing.T) {
+	server := sseServer(t, []string{
+		sseTextChunk(t, "  {\"answer\":", ""),
+		sseTextChunk(t, "\"Daksha\"} \n", "stop"),
+		`[DONE]`,
+	})
+	defer server.Close()
+
+	stream := NewStreamer().Stream(context.Background(),
+		ai.Provider{BaseURL: server.URL + "/", APIKey: "k"}, ai.Model{ID: "m"},
+		ai.Prompt{Messages: []ai.Message{userText("hi")}},
+		ai.StreamOptions{OutputFormat: ai.OutputFormat{Type: ai.OutputFormatJSONObject}},
+	)
+	events, msg, err := collectStream(t, stream)
+	if err != nil {
+		t.Fatalf("Result: %v", err)
+	}
+	wantTypes := []ai.AssistantMessageEventType{
+		ai.AssistantEventStart,
+		ai.AssistantEventTextStart,
+		ai.AssistantEventTextDelta,
+		ai.AssistantEventTextDelta,
+		ai.AssistantEventTextEnd,
+		ai.AssistantEventDone,
+	}
+	if got := eventTypes(events); !reflect.DeepEqual(got, wantTypes) {
+		t.Fatalf("event sequence = %v, want %v", got, wantTypes)
+	}
+	if msg.StopReason != ai.StopReasonStop {
+		t.Fatalf("StopReason = %s, error = %q", msg.StopReason, msg.ErrorMessage)
+	}
+	text := msg.Content[0].(*ai.TextContent).Text
+	if text != "  {\"answer\":\"Daksha\"} \n" || !json.Valid([]byte(text)) {
+		t.Fatalf("final text = %q", text)
+	}
+}
+
+func TestStreamerRejectsInvalidFinalJSON(t *testing.T) {
+	schemaFormat := ai.OutputFormat{
+		Type: ai.OutputFormatJSONSchema,
+		JSONSchema: &ai.JSONSchema{
+			Name: "answer", Schema: map[string]any{"type": "object"}, Strict: true,
+		},
+	}
+	tests := []struct {
+		name         string
+		content      string
+		finishReason string
+		format       ai.OutputFormat
+		wantError    string
+	}{
+		{
+			name: "truncated json object", content: `{"answer":`, finishReason: "length",
+			format: ai.OutputFormat{Type: ai.OutputFormatJSONObject}, wantError: "invalid final JSON",
+		},
+		{
+			name: "trailing content under json schema", content: `{"answer":"ok"} trailing`, finishReason: "stop",
+			format: schemaFormat, wantError: "invalid final JSON",
+		},
+		{
+			name: "empty json object", finishReason: "stop",
+			format: ai.OutputFormat{Type: ai.OutputFormatJSONObject}, wantError: "produced no JSON content",
+		},
+		{
+			name: "array is not json object", content: `[]`, finishReason: "stop",
+			format: ai.OutputFormat{Type: ai.OutputFormatJSONObject}, wantError: "invalid final JSON object",
+		},
+		{
+			name: "null is not json object", content: `null`, finishReason: "stop",
+			format: ai.OutputFormat{Type: ai.OutputFormatJSONObject}, wantError: "invalid final JSON object",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := sseServer(t, []string{
+				sseTextChunk(t, tt.content, tt.finishReason),
+				`[DONE]`,
+			})
+			defer server.Close()
+
+			stream := NewStreamer().Stream(context.Background(),
+				ai.Provider{BaseURL: server.URL + "/", APIKey: "k"}, ai.Model{ID: "m"},
+				ai.Prompt{Messages: []ai.Message{userText("hi")}},
+				ai.StreamOptions{OutputFormat: tt.format},
+			)
+			events, msg, err := collectStream(t, stream)
+			if err != nil {
+				t.Fatalf("Result: %v", err)
+			}
+			if msg.StopReason != ai.StopReasonError || !strings.Contains(msg.ErrorMessage, tt.wantError) {
+				t.Fatalf("result = stop %s, error %q", msg.StopReason, msg.ErrorMessage)
+			}
+			for _, event := range events {
+				if event.EventType() == ai.AssistantEventDone || event.EventType() == ai.AssistantEventTextEnd {
+					t.Fatalf("invalid JSON published terminal success event %s", event.EventType())
+				}
+			}
+			if len(events) == 0 || events[len(events)-1].EventType() != ai.AssistantEventError {
+				t.Fatalf("event sequence = %v", eventTypes(events))
+			}
+			if tt.content != "" {
+				text, ok := msg.Content[0].(*ai.TextContent)
+				if !ok || text.Text != tt.content {
+					t.Fatalf("partial content = %#v, want %q", msg.Content, tt.content)
+				}
+			}
+		})
+	}
+}
+
+func TestStreamerPreservesStructuredOutputRefusal(t *testing.T) {
+	server := sseServer(t, []string{
+		`{"id":"r","choices":[{"index":0,"delta":{"refusal":"I cannot "}}]}`,
+		`{"id":"r","choices":[{"index":0,"delta":{"refusal":"help with that."},"finish_reason":"stop"}]}`,
+		`[DONE]`,
+	})
+	defer server.Close()
+
+	stream := NewStreamer().Stream(context.Background(),
+		ai.Provider{BaseURL: server.URL + "/", APIKey: "k"}, ai.Model{ID: "m"},
+		ai.Prompt{Messages: []ai.Message{userText("hi")}},
+		ai.StreamOptions{OutputFormat: ai.OutputFormat{Type: ai.OutputFormatJSONObject}},
+	)
+	events, msg, err := collectStream(t, stream)
+	if err != nil {
+		t.Fatalf("Result: %v", err)
+	}
+	if msg.StopReason != ai.StopReasonError || !strings.Contains(msg.ErrorMessage, "structured output refused") {
+		t.Fatalf("message = stop %s, error %q", msg.StopReason, msg.ErrorMessage)
+	}
+	if got := msg.Diagnostics.Details["refusal"]; got != "I cannot help with that." {
+		t.Fatalf("diagnostic refusal = %#v", got)
+	}
+	if len(events) == 0 || events[len(events)-1].EventType() != ai.AssistantEventError {
+		t.Fatalf("event sequence = %v", eventTypes(events))
+	}
+}
+
+func TestSnapshotOutputFormatDetachesSchema(t *testing.T) {
+	nested := map[string]any{"type": "string"}
+	original := ai.OutputFormat{
+		Type: ai.OutputFormatJSONSchema,
+		JSONSchema: &ai.JSONSchema{
+			Name: "answer",
+			Schema: map[string]any{
+				"type":       "object",
+				"properties": map[string]any{"answer": nested},
+				"required":   []string{"answer"},
+			},
+		},
+	}
+	snapshot, err := snapshotOutputFormat(original)
+	if err != nil {
+		t.Fatalf("snapshotOutputFormat: %v", err)
+	}
+
+	nested["type"] = "number"
+	original.JSONSchema.Schema["required"].([]string)[0] = "changed"
+
+	properties := snapshot.JSONSchema.Schema["properties"].(map[string]any)
+	answer := properties["answer"].(map[string]any)
+	if answer["type"] != "string" {
+		t.Fatalf("snapshot answer schema = %#v", answer)
+	}
+	required := snapshot.JSONSchema.Schema["required"].([]any)
+	if required[0] != "answer" {
+		t.Fatalf("snapshot required = %#v", required)
+	}
+}
+
+func TestStreamerStructuredOutputSkipsJSONValidationForToolCallTurn(t *testing.T) {
+	server := sseServer(t, []string{
+		`{"id":"r","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`,
+		`[DONE]`,
+	})
+	defer server.Close()
+
+	stream := NewStreamer().Stream(context.Background(),
+		ai.Provider{BaseURL: server.URL + "/", APIKey: "k"}, ai.Model{ID: "m"},
+		ai.Prompt{Messages: []ai.Message{userText("hi")}},
+		ai.StreamOptions{OutputFormat: ai.OutputFormat{Type: ai.OutputFormatJSONObject}},
+	)
+	events, msg, err := collectStream(t, stream)
+	if err != nil {
+		t.Fatalf("Result: %v", err)
+	}
+	if msg.StopReason != ai.StopReasonToolUse {
+		t.Fatalf("StopReason = %s, error = %q", msg.StopReason, msg.ErrorMessage)
+	}
+	if events[len(events)-1].EventType() != ai.AssistantEventDone {
+		t.Fatalf("event sequence = %v", eventTypes(events))
+	}
+}
+
+func TestStreamerTextOutputDoesNotValidateJSON(t *testing.T) {
+	server := sseServer(t, []string{
+		sseTextChunk(t, "plain text", "stop"),
+		`[DONE]`,
+	})
+	defer server.Close()
+
+	stream := NewStreamer().Stream(context.Background(),
+		ai.Provider{BaseURL: server.URL + "/", APIKey: "k"}, ai.Model{ID: "m"},
+		ai.Prompt{Messages: []ai.Message{userText("hi")}},
+		ai.StreamOptions{OutputFormat: ai.OutputFormat{Type: ai.OutputFormatText}},
+	)
+	_, msg, err := collectStream(t, stream)
+	if err != nil {
+		t.Fatalf("Result: %v", err)
+	}
+	if msg.StopReason != ai.StopReasonStop || msg.Content[0].(*ai.TextContent).Text != "plain text" {
+		t.Fatalf("message = %#v", msg)
+	}
+}
+
+func TestStreamerInvalidOutputFormatIsEncodedInStream(t *testing.T) {
+	stream := NewStreamer().Stream(context.Background(), ai.Provider{}, ai.Model{ID: "m"}, ai.Prompt{},
+		ai.StreamOptions{OutputFormat: ai.OutputFormat{Type: "yaml"}},
+	)
+	events, msg, err := collectStream(t, stream)
+	if err != nil {
+		t.Fatalf("Result: %v", err)
+	}
+	if len(events) != 1 || events[0].EventType() != ai.AssistantEventError {
+		t.Fatalf("event sequence = %v", eventTypes(events))
+	}
+	if msg.StopReason != ai.StopReasonError || !strings.Contains(msg.ErrorMessage, "unknown output format") {
+		t.Fatalf("message = stop %s, error %q", msg.StopReason, msg.ErrorMessage)
 	}
 }
 
@@ -328,11 +579,13 @@ func TestStreamerMissingFinishReasonIsError(t *testing.T) {
 	s := NewStreamer()
 	stream := s.Stream(context.Background(),
 		ai.Provider{BaseURL: server.URL + "/", APIKey: "k"}, ai.Model{ID: "m"},
-		ai.Prompt{Messages: []ai.Message{userText("hi")}}, ai.StreamOptions{})
+		ai.Prompt{Messages: []ai.Message{userText("hi")}}, ai.StreamOptions{
+			OutputFormat: ai.OutputFormat{Type: ai.OutputFormatJSONObject},
+		})
 
 	_, msg, _ := collectStream(t, stream)
-	if msg.StopReason != ai.StopReasonError {
-		t.Errorf("StopReason = %v, want error", msg.StopReason)
+	if msg.StopReason != ai.StopReasonError || !strings.Contains(msg.ErrorMessage, "without finish_reason") {
+		t.Errorf("message = stop %v, error %q", msg.StopReason, msg.ErrorMessage)
 	}
 }
 
