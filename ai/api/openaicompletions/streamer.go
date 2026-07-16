@@ -135,6 +135,12 @@ func (s *Streamer) run(ctx context.Context, producer *ai.Producer[ai.AssistantMe
 		fail(ctx, producer, msg, err)
 		return
 	}
+	if hasFinishReason {
+		if err := validateToolCallState(msg.StopReason, acc.toolOrder); err != nil {
+			fail(ctx, producer, msg, err)
+			return
+		}
+	}
 	if err := acc.finishAll(ctx, hasFinishReason); err != nil {
 		if ctx.Err() == nil {
 			fail(ctx, producer, msg, err)
@@ -209,40 +215,10 @@ type toolCallState struct {
 // contains interface slices, pointer-backed content blocks and JSON maps, so a
 // plain struct copy would let later deltas rewrite already-published events.
 func snapshotAssistantMessage(msg *ai.AssistantMessage) ai.AssistantMessage {
-	snapshot := *msg
-	if msg.Content != nil {
-		snapshot.Content = make([]ai.AssistantContent, len(msg.Content))
-		for i, content := range msg.Content {
-			switch content := content.(type) {
-			case *ai.TextContent:
-				if content != nil {
-					copy := *content
-					snapshot.Content[i] = &copy
-				}
-			case *ai.JSONContent:
-				if content != nil {
-					copy := *content
-					copy.Value = cloneRawMessage(content.Value)
-					snapshot.Content[i] = &copy
-				}
-			case *ai.ThinkingContent:
-				if content != nil {
-					copy := *content
-					snapshot.Content[i] = &copy
-				}
-			case *ai.ToolCallContent:
-				if content != nil {
-					copy := *content
-					copy.Arguments = cloneJSONMap(content.Arguments)
-					snapshot.Content[i] = &copy
-				}
-			default:
-				snapshot.Content[i] = content
-			}
-		}
+	if snapshot := ai.CloneAssistantMessage(msg); snapshot != nil {
+		return *snapshot
 	}
-	snapshot.Diagnostics.Details = cloneJSONMap(msg.Diagnostics.Details)
-	return snapshot
+	return ai.AssistantMessage{}
 }
 
 func cloneRawMessage(src json.RawMessage) json.RawMessage {
@@ -631,11 +607,52 @@ func mapStopReason(reason string) (ai.StopReason, string) {
 		return ai.StopReasonStop, ""
 	case "length":
 		return ai.StopReasonLength, ""
-	case "tool_calls", "function_call":
+	case "tool_calls":
 		return ai.StopReasonToolUse, ""
+	case "function_call":
+		return ai.StopReasonError,
+			"provider used unsupported legacy function_call protocol; expected tool_calls"
 	default:
 		// content_filter, network_error and anything unknown: never silently
 		// treat an abnormal termination as a clean stop.
 		return ai.StopReasonError, "provider finish_reason: " + reason
 	}
+}
+
+// validateToolCallState keeps the neutral message contract unambiguous: a
+// successful tool-use finish must contain executable calls, and successful
+// non-tool finishes must not contain calls that the agent would otherwise
+// silently ignore. Error turns may retain partial calls for diagnostics.
+func validateToolCallState(reason ai.StopReason, calls []*toolCallState) error {
+	callCount := len(calls)
+	switch reason {
+	case ai.StopReasonToolUse:
+		if callCount == 0 {
+			return errors.New("openai: tool-use finish reason without tool calls")
+		}
+		seenIDs := make(map[string]struct{}, callCount)
+		for i, state := range calls {
+			call := state.block
+			if call.Type != ai.ContentTypeToolCall {
+				return fmt.Errorf("openai: tool call %d has invalid content type %q", i, call.Type)
+			}
+			if call.Id == "" {
+				return fmt.Errorf("openai: tool call %d has an empty id", i)
+			}
+			if call.Name == "" {
+				return fmt.Errorf("openai: tool call %q has an empty name", call.Id)
+			}
+			if _, duplicate := seenIDs[call.Id]; duplicate {
+				return fmt.Errorf("openai: duplicate tool call id %q", call.Id)
+			}
+			seenIDs[call.Id] = struct{}{}
+		}
+	case ai.StopReasonStop, ai.StopReasonLength:
+		if callCount > 0 {
+			return fmt.Errorf(
+				"openai: received %d tool call(s) with stop reason %q", callCount, reason,
+			)
+		}
+	}
+	return nil
 }

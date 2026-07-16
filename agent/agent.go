@@ -46,7 +46,8 @@ type Config struct {
 	TransformContext func(ctx context.Context, messages []ai.Message) ([]ai.Message, error)
 	// BeforeToolCall runs after tool_execution_start; a non-nil error
 	// blocks the call and is reported to the model as an IsError result.
-	// The permission/audit choke point.
+	// It receives a detached call snapshot; mutations are local to the hook
+	// and are not forwarded to Execute. The permission/audit choke point.
 	BeforeToolCall func(ctx context.Context, call ai.ToolCallContent) error
 	// ShouldStopAfterTurn is polled after each completed turn; returning
 	// true ends the run gracefully before queue checks and the next LLM
@@ -113,7 +114,7 @@ func New(cfg Config) (*Agent, error) {
 		transformContext:    cfg.TransformContext,
 		beforeToolCall:      cfg.BeforeToolCall,
 		shouldStopAfterTurn: cfg.ShouldStopAfterTurn,
-		messages:            append([]ai.Message(nil), cfg.Messages...),
+		messages:            cloneMessages(cfg.Messages),
 	}, nil
 }
 
@@ -294,7 +295,7 @@ func (a *Agent) Reset() error {
 func (a *Agent) Messages() []ai.Message {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	return append([]ai.Message(nil), a.messages...)
+	return cloneMessages(a.messages)
 }
 
 func (a *Agent) IsRunning() bool {

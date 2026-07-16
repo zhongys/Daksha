@@ -145,12 +145,14 @@ func (a *Agent) run(ctx context.Context, cancel context.CancelFunc, runID uint64
 		for ev := range stream.Events() {
 			switch e := ev.(type) {
 			case ai.StartEvent:
-				partial := e.Partial
-				em.publish(MessageStartEvent{Message: &partial})
+				em.publish(MessageStartEvent{Message: ai.CloneAssistantMessage(&e.Partial)})
 			case ai.DoneEvent, ai.ErrorEvent:
 				// The final message arrives via Result below.
 			default:
-				em.publish(MessageUpdateEvent{Message: partialOf(ev), Inner: ev})
+				inner := cloneAssistantEvent(ev)
+				em.publish(MessageUpdateEvent{
+					Message: ai.CloneAssistantMessage(partialOf(inner)), Inner: inner,
+				})
 			}
 		}
 		final, err := stream.Result(ctx)
@@ -160,20 +162,30 @@ func (a *Agent) run(ctx context.Context, cancel context.CancelFunc, runID uint64
 			runErr = err
 			break
 		}
+		final = ai.CloneAssistantMessage(final)
+		// Freeze executable calls before publishing the final message. Event
+		// consumers must not be able to change what the permission hook or tool
+		// handler will receive.
+		calls, toolErr := validatedToolCalls(final)
+		if final == nil {
+			runErr = toolErr
+			break
+		}
 		record(final)
-		em.publish(MessageEndEvent{Message: final})
+		em.publish(MessageEndEvent{Message: ai.CloneAssistantMessage(final)})
 		last = final
 
 		var toolResults []ai.Message
 		terminate := false
-		var toolErr error
-		if final.StopReason == ai.StopReasonToolUse {
-			toolResults, terminate, runOutput, toolErr = a.executeTools(ctx, em, cfg, final)
+		if toolErr == nil && final.StopReason == ai.StopReasonToolUse {
+			toolResults, terminate, runOutput, toolErr = a.executeTools(ctx, em, cfg, calls)
 			for _, r := range toolResults {
 				newMessages = append(newMessages, r)
 			}
 		}
-		em.publish(TurnEndEvent{Turn: turn, Message: final, ToolResults: toolResults})
+		em.publish(TurnEndEvent{
+			Turn: turn, Message: ai.CloneAssistantMessage(final), ToolResults: toolResults,
+		})
 		if toolErr != nil {
 			runErr = toolErr
 			break
@@ -185,7 +197,8 @@ func (a *Agent) run(ctx context.Context, cancel context.CancelFunc, runID uint64
 		if terminate {
 			break
 		}
-		if a.shouldStopAfterTurn != nil && a.shouldStopAfterTurn(ctx, final, a.Messages()) {
+		if a.shouldStopAfterTurn != nil &&
+			a.shouldStopAfterTurn(ctx, ai.CloneAssistantMessage(final), a.Messages()) {
 			break
 		}
 
@@ -214,14 +227,14 @@ func (a *Agent) run(ctx context.Context, cancel context.CancelFunc, runID uint64
 	if runErr == nil && em.err != nil {
 		runErr = em.err
 	}
-	em.publish(AgentEndEvent{NewMessages: newMessages, Output: runOutput})
+	em.publish(AgentEndEvent{NewMessages: cloneMessages(newMessages), Output: runOutput})
 	// Result() must imply that the agent is ready for its next run. Retire
 	// before Complete makes the result visible; the run identity protects a
 	// new run from the deferred cleanup above.
 	a.retireRun(runID)
 	_ = producer.Complete(ctx, &RunResult{
-		NewMessages: newMessages,
-		Last:        last,
+		NewMessages: cloneMessages(newMessages),
+		Last:        ai.CloneAssistantMessage(last),
 		Output:      runOutput,
 		Err:         runErr,
 	})
@@ -246,16 +259,10 @@ type toolOutcome struct {
 // its permission hook nor handler is invoked. Already-running handlers still
 // get their canceled context and are allowed to unwind normally.
 func (a *Agent) executeTools(ctx context.Context, em *emitter, cfg runConfig,
-	final *ai.AssistantMessage) ([]ai.Message, bool, *RunOutput, error) {
+	calls []*ai.ToolCallContent) ([]ai.Message, bool, *RunOutput, error) {
 
-	var calls []*ai.ToolCallContent
-	for _, c := range final.Content {
-		if tc, ok := c.(*ai.ToolCallContent); ok {
-			calls = append(calls, tc)
-		}
-	}
 	if len(calls) == 0 {
-		return nil, false, nil, nil
+		return nil, false, nil, fmt.Errorf("agent: tool execution requested without tool calls")
 	}
 
 	byName := map[string]Tool{}
@@ -297,7 +304,7 @@ func (a *Agent) executeTools(ctx context.Context, em *emitter, cfg runConfig,
 			return false
 		}
 		if !em.publish(ToolExecutionStartEvent{
-			ToolCallID: o.call.Id, ToolName: o.call.Name, Args: o.call.Arguments,
+			ToolCallID: o.call.Id, ToolName: o.call.Name, Args: cloneToolArguments(o.call.Arguments),
 		}) {
 			finalizeSkipped(o, stopError())
 			return false
@@ -318,7 +325,8 @@ func (a *Agent) executeTools(ctx context.Context, em *emitter, cfg runConfig,
 				finalizeSkipped(o, err)
 				return false
 			}
-			err := a.beforeToolCall(ctx, *o.call)
+			call := cloneToolCallContent(o.call)
+			err := a.beforeToolCall(ctx, *call)
 			if stopErr := stopError(); stopErr != nil {
 				finalizeSkipped(o, stopErr)
 				return false
@@ -354,7 +362,7 @@ func (a *Agent) executeTools(ctx context.Context, em *emitter, cfg runConfig,
 			return
 		}
 		o.pending = false
-		out, err := tool.Execute(ctx, o.call.Id, o.call.Arguments, onUpdate)
+		out, err := tool.Execute(ctx, o.call.Id, cloneToolArguments(o.call.Arguments), onUpdate)
 		if err != nil {
 			o.msg = errorResult(o.call, err)
 		} else {

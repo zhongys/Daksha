@@ -50,7 +50,9 @@ type terminalValue struct {
 //
 // Execute returns an error to signal tool failure — never encode failures
 // into Content. The loop reports errors to the model as a toolResult with
-// IsError set, so it can react. onUpdate may be nil.
+// IsError set, so it can react. args is a detached JSON tree owned by this
+// invocation; mutating it cannot change history, events, or permission-hook
+// input. onUpdate may be nil.
 type Tool interface {
 	// Definition is what the LLM sees: name, description and the JSON
 	// Schema of the arguments. Label (UI display name) rides alongside.

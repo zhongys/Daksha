@@ -631,6 +631,104 @@ func TestStreamerUnknownFinishReasonIsError(t *testing.T) {
 	}
 }
 
+func TestStreamerRejectsInconsistentToolState(t *testing.T) {
+	tests := []struct {
+		name        string
+		events      []string
+		errorPart   string
+		forbidEvent ai.AssistantMessageEventType
+	}{
+		{
+			name: "tool finish without calls",
+			events: []string{
+				`{"id":"r","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+				`[DONE]`,
+			},
+			errorPart: "without tool calls",
+		},
+		{
+			name: "stop finish with calls",
+			events: []string{
+				`{"id":"r","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]},"finish_reason":"stop"}]}`,
+				`[DONE]`,
+			},
+			errorPart:   "with stop reason",
+			forbidEvent: ai.AssistantEventToolCallEnd,
+		},
+		{
+			name: "tool call with empty id",
+			events: []string{
+				`{"id":"r","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"lookup","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`,
+				`[DONE]`,
+			},
+			errorPart:   "empty id",
+			forbidEvent: ai.AssistantEventToolCallEnd,
+		},
+		{
+			name: "tool call with empty name",
+			events: []string{
+				`{"id":"r","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`,
+				`[DONE]`,
+			},
+			errorPart:   "empty name",
+			forbidEvent: ai.AssistantEventToolCallEnd,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := sseServer(t, tt.events)
+			defer server.Close()
+
+			stream := NewStreamer().Stream(context.Background(),
+				ai.Provider{BaseURL: server.URL + "/", APIKey: "k"}, ai.Model{ID: "m"},
+				ai.Prompt{Messages: []ai.Message{userText("hi")}}, ai.StreamOptions{})
+
+			events, msg, err := collectStream(t, stream)
+			if err != nil {
+				t.Fatalf("Result: %v", err)
+			}
+			if msg.StopReason != ai.StopReasonError || !strings.Contains(msg.ErrorMessage, tt.errorPart) {
+				t.Fatalf("message = stop %q, error %q", msg.StopReason, msg.ErrorMessage)
+			}
+			if events[len(events)-1].EventType() != ai.AssistantEventError {
+				t.Fatalf("event sequence = %v, want terminal error", eventTypes(events))
+			}
+			for _, event := range events {
+				if tt.forbidEvent != "" && event.EventType() == tt.forbidEvent {
+					t.Fatalf("event sequence = %v, must not publish %s", eventTypes(events), tt.forbidEvent)
+				}
+			}
+		})
+	}
+}
+
+func TestStreamerRejectsLegacyFunctionCallProtocol(t *testing.T) {
+	server := sseServer(t, []string{
+		`{"id":"r","choices":[{"index":0,"delta":{"function_call":{"name":"lookup","arguments":"{\"id\":"}}}]}`,
+		`{"id":"r","choices":[{"index":0,"delta":{"function_call":{"arguments":"1}"}},"finish_reason":"function_call"}]}`,
+		`[DONE]`,
+	})
+	defer server.Close()
+
+	stream := NewStreamer().Stream(context.Background(),
+		ai.Provider{BaseURL: server.URL + "/", APIKey: "k"}, ai.Model{ID: "m"},
+		ai.Prompt{Messages: []ai.Message{userText("hi")}}, ai.StreamOptions{})
+
+	events, msg, err := collectStream(t, stream)
+	if err != nil {
+		t.Fatalf("Result: %v", err)
+	}
+	if msg.StopReason != ai.StopReasonError || !strings.Contains(msg.ErrorMessage, "function_call") {
+		t.Fatalf("message = stop %q, error %q", msg.StopReason, msg.ErrorMessage)
+	}
+	if got := eventTypes(events); !reflect.DeepEqual(got, []ai.AssistantMessageEventType{
+		ai.AssistantEventStart, ai.AssistantEventError,
+	}) {
+		t.Fatalf("event sequence = %v", got)
+	}
+}
+
 func TestStreamerMissingFinishReasonIsError(t *testing.T) {
 	server := sseServer(t, []string{
 		`{"id":"r","choices":[{"index":0,"delta":{"content":"x"}}]}`,

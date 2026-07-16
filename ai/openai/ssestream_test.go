@@ -2,6 +2,7 @@ package openai
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +10,10 @@ import (
 	"testing"
 	"time"
 )
+
+type terminalErrorReader struct{ err error }
+
+func (r terminalErrorReader) Read([]byte) (int, error) { return 0, r.err }
 
 func TestStreamSkipsCommentOnlySSEBlocks(t *testing.T) {
 	res := &http.Response{Body: io.NopCloser(strings.NewReader(
@@ -32,6 +37,97 @@ func TestStreamSkipsCommentOnlySSEBlocks(t *testing.T) {
 	}
 	if err := stream.Err(); err != nil {
 		t.Fatalf("Err() = %v, want nil", err)
+	}
+}
+
+func TestStreamDoneDoesNotWaitForResponseBodyEOF(t *testing.T) {
+	reader, writer := io.Pipe()
+	stream := NewStream[struct{}](NewDecoder(&http.Response{Body: reader}), nil)
+	defer stream.Close()
+	defer writer.Close()
+
+	written := make(chan error, 1)
+	go func() {
+		_, err := io.WriteString(writer, "data: [DONE]\n\n")
+		written <- err
+	}()
+
+	next := make(chan bool, 1)
+	go func() {
+		next <- stream.Next()
+	}()
+
+	select {
+	case got := <-next:
+		if got {
+			t.Fatal("Next() = true after [DONE], want false")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Next() waited for response body EOF after [DONE]")
+	}
+
+	if err := <-written; err != nil {
+		t.Fatalf("writing [DONE]: %v", err)
+	}
+	if err := stream.Err(); err != nil {
+		t.Fatalf("Err() = %v, want nil", err)
+	}
+}
+
+func TestStreamRequiresExactDoneMarker(t *testing.T) {
+	res := &http.Response{Body: io.NopCloser(strings.NewReader(
+		"data: [DONE] trailing-data\n\n",
+	))}
+	stream := NewStream[struct{}](NewDecoder(res), nil)
+	defer stream.Close()
+
+	if stream.Next() {
+		t.Fatal("Next() accepted invalid JSON after a [DONE] prefix")
+	}
+	if stream.Err() == nil {
+		t.Fatal("Err() = nil, want JSON decoding error for a non-exact [DONE] marker")
+	}
+}
+
+func TestStreamDispatchesFinalDataBlockAtEOF(t *testing.T) {
+	res := &http.Response{Body: io.NopCloser(strings.NewReader(
+		"event: result\ndata: {\"value\":7}",
+	))}
+	stream := NewStream[struct {
+		Value int `json:"value"`
+	}](NewDecoder(res), nil)
+	defer stream.Close()
+
+	if !stream.Next() {
+		t.Fatalf("Next() = false, err = %v", stream.Err())
+	}
+	if got := stream.Current().Value; got != 7 {
+		t.Fatalf("value = %d, want 7", got)
+	}
+	if stream.Next() {
+		t.Fatal("Next() returned the final event more than once")
+	}
+	if err := stream.Err(); err != nil {
+		t.Fatalf("Err() = %v, want nil", err)
+	}
+}
+
+func TestStreamScannerErrorWinsOverPendingData(t *testing.T) {
+	wantErr := errors.New("read failed")
+	reader := io.MultiReader(
+		strings.NewReader("data: {\"value\":7}"),
+		terminalErrorReader{err: wantErr},
+	)
+	stream := NewStream[struct {
+		Value int `json:"value"`
+	}](NewDecoder(&http.Response{Body: io.NopCloser(reader)}), nil)
+	defer stream.Close()
+
+	if stream.Next() {
+		t.Fatal("Next() dispatched pending data after a scanner error")
+	}
+	if !errors.Is(stream.Err(), wantErr) {
+		t.Fatalf("Err() = %v, want %v", stream.Err(), wantErr)
 	}
 }
 

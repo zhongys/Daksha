@@ -78,7 +78,8 @@ func (MessageEndEvent) EventType() EventType { return EventMessageEnd }
 type ToolExecutionStartEvent struct {
 	ToolCallID string
 	ToolName   string
-	Args       map[string]any
+	// Args is owned by this event and detached from history and execution.
+	Args map[string]any
 }
 
 func (ToolExecutionStartEvent) EventType() EventType { return EventToolExecutionStart }
@@ -129,8 +130,9 @@ func RunOutputAs[T any](output *RunOutput) (T, bool) {
 //
 // Model-side failures (vendor errors, aborts) live on Last.StopReason per
 // the ai layer contract. Err reports agent-level failures only: MaxTurns
-// exceeded, TransformContext errors, an ambiguous terminal-tool batch, or a
-// broken stream. NewMessages is valid either way.
+// exceeded, TransformContext errors, invalid assistant/tool state, an
+// ambiguous terminal-tool batch, or a broken stream. NewMessages is valid
+// either way.
 type RunResult struct {
 	NewMessages []ai.Message
 	Last        *ai.AssistantMessage

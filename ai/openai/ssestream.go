@@ -103,8 +103,20 @@ func (s *eventStreamDecoder) Next() bool {
 		}
 	}
 
-	if s.scn.Err() != nil {
-		s.err = s.scn.Err()
+	if err := s.scn.Err(); err != nil {
+		s.err = err
+		return false
+	}
+
+	// Compatibility: some OpenAI-compatible endpoints omit the final empty
+	// line. After a clean EOF, dispatch their pending data block as if it had
+	// been terminated normally.
+	if data.Len() > 0 {
+		s.evt = Event{
+			Type: event,
+			Data: data.Bytes(),
+		}
+		return true
 	}
 
 	return false
@@ -148,22 +160,18 @@ func NewStream[T any](decoder Decoder, err error) *Stream[T] {
 //		...
 //	}
 func (s *Stream[T]) Next() bool {
-	if s.err != nil {
+	if s.err != nil || s.done {
 		return false
 	}
 
 	for s.decoder.Next() {
-		if s.done {
-			continue
-		}
-
-		if bytes.HasPrefix(s.decoder.Event().Data, []byte("[DONE]")) {
-			// In this case we don't break because we still want to iterate through the full stream.
+		data := s.decoder.Event().Data
+		if bytes.Equal(bytes.TrimSuffix(data, []byte("\n")), []byte("[DONE]")) {
 			s.done = true
-			continue
+			return false
 		}
 
-		if apiErr := errorFromEventData(s.decoder.Event().Data); apiErr != nil {
+		if apiErr := errorFromEventData(data); apiErr != nil {
 			s.err = &StreamError{
 				Message: fmt.Sprintf("received error while streaming: %s", apiErr.Message),
 				Event:   s.decoder.Event(),
@@ -172,7 +180,7 @@ func (s *Stream[T]) Next() bool {
 		}
 
 		var nxt T
-		s.err = json.Unmarshal(s.decoder.Event().Data, &nxt)
+		s.err = json.Unmarshal(data, &nxt)
 		if s.err != nil {
 			return false
 		}
