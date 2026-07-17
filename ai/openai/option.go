@@ -118,18 +118,15 @@ func WithQueryDel(key string) RequestOption {
 }
 
 // WithJSONSet returns a RequestOption that sets the top-level key of the
-// serialized JSON body to the given value. The body must be a JSON object.
-func WithJSONSet(key string, value any) RequestOption {
-	raw, snapshotErr := jsonMarshalNoEscape(value)
-	if snapshotErr != nil {
-		// json.UnsupportedValueError may retain a reflect.Value into the
-		// rejected input. An option is long-lived, so keep immutable text only.
-		snapshotErr = fmt.Errorf("%s", snapshotErr)
+// serialized JSON body to the given value. The value is serialized and
+// snapshotted before return; invalid JSON values return an error immediately.
+// The body must be a JSON object when the option is applied.
+func WithJSONSet(key string, value any) (RequestOption, error) {
+	raw, err := jsonMarshalNoEscape(value)
+	if err != nil {
+		return nil, fmt.Errorf("requestoption: WithJSONSet failed to encode value: %w", err)
 	}
 	return RequestOptionFunc(func(r *RequestConfig) (err error) {
-		if snapshotErr != nil {
-			return snapshotErr
-		}
 		m := map[string]json.RawMessage{}
 
 		if r.Body != nil {
@@ -155,7 +152,7 @@ func WithJSONSet(key string, value any) RequestOption {
 		}
 		r.Body = bytes.NewBuffer(b)
 		return nil
-	})
+	}), nil
 }
 
 // WithJSONDel returns a RequestOption that deletes the top-level key from the

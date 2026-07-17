@@ -19,7 +19,6 @@ type runConfig struct {
 	tools         []Tool
 	definitions   []ai.ToolDefinition
 	options       ai.StreamOptions
-	optionsErr    error
 	toolExecution ExecutionMode
 	maxTurns      int
 }
@@ -33,14 +32,10 @@ func (a *Agent) snapshotConfig() (runConfig, error) {
 		systemPrompt:  a.systemPrompt,
 		tools:         append([]Tool(nil), a.tools...),
 		options:       a.options,
-		optionsErr:    a.optionsErr,
 		toolExecution: a.toolExecution,
 		maxTurns:      a.maxTurns,
 	}
 	a.mu.RUnlock()
-	if config.optionsErr != nil {
-		return runConfig{}, config.optionsErr
-	}
 
 	// SnapshotStreamOptions may invoke a custom JSON marshaler. Never execute
 	// caller code while holding the agent mutex: it may call a setter itself.
@@ -160,11 +155,7 @@ func (a *Agent) run(ctx context.Context, cancel context.CancelFunc, runID uint64
 				break
 			}
 		}
-		cfg.definitions, err = definitions(cfg.tools)
-		if err != nil {
-			runErr = err
-			break
-		}
+		cfg.definitions = definitions(cfg.tools)
 
 		prompt, err := ai.SnapshotPrompt(ai.Prompt{
 			System:   cfg.systemPrompt,
@@ -516,21 +507,16 @@ func successResult(call *ai.ToolCallContent, out *ToolOutput) *ai.ToolResultMess
 	return msg
 }
 
-func definitions(tools []Tool) ([]ai.ToolDefinition, error) {
+func definitions(tools []Tool) []ai.ToolDefinition {
 	if len(tools) == 0 {
-		return nil, nil
+		return nil
 	}
 	defs := make([]ai.ToolDefinition, 0, len(tools))
 	for _, t := range tools {
-		if source, ok := t.(interface{ definitionSnapshotError() error }); ok {
-			if err := source.definitionSnapshotError(); err != nil {
-				return nil, err
-			}
-		}
 		definition := t.Definition().ToolDefinition
 		defs = append(defs, ai.CloneToolDefinition(definition))
 	}
-	return defs, nil
+	return defs
 }
 
 // partialOf extracts the partial assistant message carried by every ai

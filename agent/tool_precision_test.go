@@ -18,7 +18,7 @@ func TestNewToolPreservesLargeIntegersInInterfaceParameters(t *testing.T) {
 	}
 
 	t.Run("map parameters", func(t *testing.T) {
-		tool := NewTool(
+		tool := mustNewTool(t,
 			ToolDefinition{ToolDefinition: ai.ToolDefinition{Name: "lookup"}},
 			func(_ context.Context, _ string, params map[string]any, _ func(ToolUpdate)) (*ToolOutput, error) {
 				assertToolJSONNumber(t, params["id"], large)
@@ -37,7 +37,7 @@ func TestNewToolPreservesLargeIntegersInInterfaceParameters(t *testing.T) {
 			ID     any            `json:"id"`
 			Nested map[string]any `json:"nested"`
 		}
-		tool := NewTool(
+		tool := mustNewTool(t,
 			ToolDefinition{ToolDefinition: ai.ToolDefinition{Name: "lookup"}},
 			func(_ context.Context, _ string, params params, _ func(ToolUpdate)) (*ToolOutput, error) {
 				assertToolJSONNumber(t, params.ID, large)

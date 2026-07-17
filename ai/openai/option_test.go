@@ -11,7 +11,10 @@ import (
 
 func TestWithJSONSetSnapshotsValueAtConstruction(t *testing.T) {
 	value := map[string]any{"nested": map[string]any{"answer": "before"}}
-	option := WithJSONSet("extra", value)
+	option, err := WithJSONSet("extra", value)
+	if err != nil {
+		t.Fatalf("WithJSONSet: %v", err)
+	}
 	value["nested"].(map[string]any)["answer"] = "after"
 
 	cfg, err := NewRequestConfig(context.Background(), http.MethodPost, "/", map[string]any{}, nil, option)
@@ -32,16 +35,23 @@ func TestWithJSONSetSnapshotsValueAtConstruction(t *testing.T) {
 	}
 }
 
-func TestWithJSONSetDefersSnapshotErrorUntilApply(t *testing.T) {
-	option := WithJSONSet("bad", func() {})
-	if _, err := NewRequestConfig(context.Background(), http.MethodPost, "/", map[string]any{}, nil, option); err == nil {
-		t.Fatal("NewRequestConfig succeeded for an unserializable option value")
+func TestWithJSONSetReturnsSnapshotErrorImmediately(t *testing.T) {
+	option, err := WithJSONSet("bad", func() {})
+	if err == nil {
+		t.Fatal("WithJSONSet succeeded for an unserializable value")
+	}
+	if option != nil {
+		t.Fatalf("WithJSONSet option = %#v, want nil on error", option)
 	}
 }
 
 func TestJSONBodyOptionsRejectNullBody(t *testing.T) {
+	setOption, err := WithJSONSet("stream", true)
+	if err != nil {
+		t.Fatalf("WithJSONSet: %v", err)
+	}
 	for name, option := range map[string]RequestOption{
-		"set": WithJSONSet("stream", true),
+		"set": setOption,
 		"del": WithJSONDel("stream"),
 	} {
 		t.Run(name, func(t *testing.T) {

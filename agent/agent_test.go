@@ -140,8 +140,28 @@ type echoParams struct {
 	Text string `json:"text"`
 }
 
-func echoTool() Tool {
-	return NewTool(ToolDefinition{ToolDefinition: ai.ToolDefinition{Name: "echo"}},
+func mustNewTool[P any](t *testing.T, def ToolDefinition,
+	fn func(context.Context, string, P, func(ToolUpdate)) (*ToolOutput, error),
+) Tool {
+	t.Helper()
+	tool, err := NewTool(def, fn)
+	if err != nil {
+		t.Fatalf("NewTool: %v", err)
+	}
+	return tool
+}
+
+func mustNewTerminalTool[P any](t *testing.T, def ToolDefinition) Tool {
+	t.Helper()
+	tool, err := NewTerminalTool[P](def)
+	if err != nil {
+		t.Fatalf("NewTerminalTool: %v", err)
+	}
+	return tool
+}
+
+func echoTool(t *testing.T) Tool {
+	return mustNewTool(t, ToolDefinition{ToolDefinition: ai.ToolDefinition{Name: "echo"}},
 		func(ctx context.Context, id string, p echoParams, onUpdate func(ToolUpdate)) (*ToolOutput, error) {
 			return &ToolOutput{
 				Content: []ai.ToolResultContent{&ai.TextContent{Type: ai.ContentTypeText, Text: p.Text}},
@@ -274,7 +294,7 @@ func TestToolLoop(t *testing.T) {
 		assistantToolCalls(toolCall("c1", "echo", map[string]any{"text": "pong"})),
 		assistantText("done"),
 	}}
-	a := newAgent(t, Config{LLM: llm, Provider: "p", Model: "m", Tools: []Tool{echoTool()}})
+	a := newAgent(t, Config{LLM: llm, Provider: "p", Model: "m", Tools: []Tool{echoTool(t)}})
 
 	stream, _ := a.PromptText(context.Background(), "ping")
 	events, res, err := drainRun(t, stream)
@@ -321,7 +341,7 @@ func TestNewToolDecodeErrorReturnsToModel(t *testing.T) {
 		assistantToolCalls(toolCall("c1", "echo", map[string]any{"text": 123})), // wrong type
 		assistantText("recovered"),
 	}}
-	a := newAgent(t, Config{LLM: llm, Provider: "p", Model: "m", Tools: []Tool{echoTool()}})
+	a := newAgent(t, Config{LLM: llm, Provider: "p", Model: "m", Tools: []Tool{echoTool(t)}})
 
 	stream, _ := a.PromptText(context.Background(), "go")
 	_, res, _ := drainRun(t, stream)
@@ -353,7 +373,7 @@ func TestUnknownToolIsError(t *testing.T) {
 func TestParallelExecutionOrdering(t *testing.T) {
 	bDone := make(chan struct{})
 	releaseA := make(chan struct{})
-	slowA := NewTool(ToolDefinition{ToolDefinition: ai.ToolDefinition{Name: "a"}},
+	slowA := mustNewTool(t, ToolDefinition{ToolDefinition: ai.ToolDefinition{Name: "a"}},
 		func(ctx context.Context, id string, _ struct{}, _ func(ToolUpdate)) (*ToolOutput, error) {
 			select {
 			case <-bDone: // finish only after b — forces reverse completion order
@@ -370,7 +390,7 @@ func TestParallelExecutionOrdering(t *testing.T) {
 			}
 			return &ToolOutput{}, nil
 		})
-	fastB := NewTool(ToolDefinition{ToolDefinition: ai.ToolDefinition{Name: "b"}},
+	fastB := mustNewTool(t, ToolDefinition{ToolDefinition: ai.ToolDefinition{Name: "b"}},
 		func(ctx context.Context, id string, _ struct{}, _ func(ToolUpdate)) (*ToolOutput, error) {
 			defer close(bDone)
 			return &ToolOutput{}, nil
@@ -423,7 +443,7 @@ func TestSequentialWrapperForcesBatchSequential(t *testing.T) {
 	var order []string
 	var mu sync.Mutex
 	mk := func(name string) Tool {
-		return NewTool(ToolDefinition{ToolDefinition: ai.ToolDefinition{Name: name}},
+		return mustNewTool(t, ToolDefinition{ToolDefinition: ai.ToolDefinition{Name: name}},
 			func(ctx context.Context, id string, _ struct{}, _ func(ToolUpdate)) (*ToolOutput, error) {
 				mu.Lock()
 				order = append(order, name)
@@ -452,7 +472,7 @@ func TestSequentialWrapperForcesBatchSequential(t *testing.T) {
 
 func TestBeforeToolCallBlocks(t *testing.T) {
 	executed := false
-	tool := NewTool(ToolDefinition{ToolDefinition: ai.ToolDefinition{Name: "danger"}},
+	tool := mustNewTool(t, ToolDefinition{ToolDefinition: ai.ToolDefinition{Name: "danger"}},
 		func(ctx context.Context, id string, _ struct{}, _ func(ToolUpdate)) (*ToolOutput, error) {
 			executed = true
 			return &ToolOutput{}, nil
@@ -485,7 +505,7 @@ func TestShouldStopAfterTurn(t *testing.T) {
 		assistantText("never reached"),
 	}}
 	a := newAgent(t, Config{
-		LLM: llm, Provider: "p", Model: "m", Tools: []Tool{echoTool()},
+		LLM: llm, Provider: "p", Model: "m", Tools: []Tool{echoTool(t)},
 		ShouldStopAfterTurn: func(ctx context.Context, last *ai.AssistantMessage, msgs []ai.Message) bool {
 			return true // e.g. cost circuit breaker tripped
 		},
@@ -505,7 +525,7 @@ func TestMaxTurnsExceeded(t *testing.T) {
 	loopCall := assistantToolCalls(toolCall("c1", "echo", map[string]any{"text": "again"}))
 	llm := &fakeLLM{script: []*ai.AssistantMessage{loopCall, loopCall, loopCall, loopCall}}
 	a := newAgent(t, Config{
-		LLM: llm, Provider: "p", Model: "m", Tools: []Tool{echoTool()}, MaxTurns: 2,
+		LLM: llm, Provider: "p", Model: "m", Tools: []Tool{echoTool(t)}, MaxTurns: 2,
 	})
 
 	stream, _ := a.PromptText(context.Background(), "go")
@@ -519,7 +539,7 @@ func TestMaxTurnsExceeded(t *testing.T) {
 }
 
 func TestTerminateSkipsFollowUpCall(t *testing.T) {
-	done := NewTool(ToolDefinition{ToolDefinition: ai.ToolDefinition{Name: "finish"}},
+	done := mustNewTool(t, ToolDefinition{ToolDefinition: ai.ToolDefinition{Name: "finish"}},
 		func(ctx context.Context, id string, _ struct{}, _ func(ToolUpdate)) (*ToolOutput, error) {
 			return &ToolOutput{Terminate: true}, nil
 		})
@@ -547,8 +567,8 @@ type finalAnswer struct {
 	ID     int64  `json:"id"`
 }
 
-func terminalAnswerTool() Tool {
-	return NewTerminalTool[finalAnswer](ToolDefinition{ToolDefinition: ai.ToolDefinition{
+func terminalAnswerTool(t *testing.T) Tool {
+	return mustNewTerminalTool[finalAnswer](t, ToolDefinition{ToolDefinition: ai.ToolDefinition{
 		Name:        "final_answer",
 		Description: "Submit the final structured answer",
 		Parameters: map[string]any{
@@ -570,7 +590,7 @@ func TestTerminalToolReturnsTypedRunOutput(t *testing.T) {
 		assistantText("never reached"),
 	}}
 	a := newAgent(t, Config{
-		LLM: llm, Provider: "p", Model: "m", Tools: []Tool{terminalAnswerTool()},
+		LLM: llm, Provider: "p", Model: "m", Tools: []Tool{terminalAnswerTool(t)},
 	})
 
 	stream, _ := a.PromptText(context.Background(), "finish")
@@ -611,7 +631,7 @@ func TestTerminalToolReturnsTypedRunOutput(t *testing.T) {
 }
 
 func TestTerminalOutputAndDetailsAreIndependentSnapshots(t *testing.T) {
-	tool := NewTerminalTool[map[string]any](ToolDefinition{ToolDefinition: ai.ToolDefinition{
+	tool := mustNewTerminalTool[map[string]any](t, ToolDefinition{ToolDefinition: ai.ToolDefinition{
 		Name: "mutable_output", Parameters: map[string]any{"type": "object"},
 	}})
 	llm := &fakeLLM{script: []*ai.AssistantMessage{
@@ -662,7 +682,7 @@ func TestTerminalToolOutputIgnoredWhenBatchContinues(t *testing.T) {
 		assistantText("done after tools"),
 	}}
 	a := newAgent(t, Config{
-		LLM: llm, Provider: "p", Model: "m", Tools: []Tool{terminalAnswerTool(), echoTool()},
+		LLM: llm, Provider: "p", Model: "m", Tools: []Tool{terminalAnswerTool(t), echoTool(t)},
 	})
 
 	stream, _ := a.PromptText(context.Background(), "go")
@@ -686,7 +706,7 @@ func TestMultipleTerminalOutputsFailDeterministically(t *testing.T) {
 		),
 	}}
 	a := newAgent(t, Config{
-		LLM: llm, Provider: "p", Model: "m", Tools: []Tool{terminalAnswerTool()},
+		LLM: llm, Provider: "p", Model: "m", Tools: []Tool{terminalAnswerTool(t)},
 	})
 
 	stream, _ := a.PromptText(context.Background(), "go")
@@ -957,7 +977,7 @@ func TestTransformContextReceivesDetachedMessages(t *testing.T) {
 func TestAgentSnapshotsOptionsAndTypedToolDefinitions(t *testing.T) {
 	required := []string{"value"}
 	property := map[string]any{"type": "string"}
-	tool := NewTool(ToolDefinition{ToolDefinition: ai.ToolDefinition{
+	tool := mustNewTool(t, ToolDefinition{ToolDefinition: ai.ToolDefinition{
 		Name: "submit", Parameters: map[string]any{
 			"type":       "object",
 			"properties": map[string]any{"value": property},
@@ -975,7 +995,7 @@ func TestAgentSnapshotsOptionsAndTypedToolDefinitions(t *testing.T) {
 	}
 
 	privateSchema := &privateSchemaMarshaler{values: map[string]any{"type": "string"}}
-	customTool := NewTool(ToolDefinition{ToolDefinition: ai.ToolDefinition{
+	customTool := mustNewTool(t, ToolDefinition{ToolDefinition: ai.ToolDefinition{
 		Name: "custom", Parameters: map[string]any{"property": privateSchema},
 	}}, func(context.Context, string, struct{}, func(ToolUpdate)) (*ToolOutput, error) {
 		return nil, nil
@@ -994,7 +1014,7 @@ func TestAgentSnapshotsOptionsAndTypedToolDefinitions(t *testing.T) {
 	}
 	llm := &fakeLLM{script: []*ai.AssistantMessage{assistantText("one"), assistantText("two")}}
 	a := newAgent(t, Config{LLM: llm, Provider: "p", Model: "m", Tools: []Tool{tool}})
-	if err := a.SetOptionsChecked(options); err != nil {
+	if err := a.SetOptions(options); err != nil {
 		t.Fatalf("SetOptions: %v", err)
 	}
 	temperature = 1
@@ -1027,32 +1047,58 @@ func TestAgentSnapshotsOptionsAndTypedToolDefinitions(t *testing.T) {
 	}
 }
 
-func TestSetOptionsPreservesSignatureAndSurfacesSnapshotErrorOnRun(t *testing.T) {
-	llm := &fakeLLM{script: []*ai.AssistantMessage{assistantText("done")}}
-	a := newAgent(t, Config{LLM: llm, Provider: "p", Model: "m"})
+func TestNewToolReturnsDefinitionSnapshotErrorAtConstruction(t *testing.T) {
+	tool, err := NewTool(ToolDefinition{ToolDefinition: ai.ToolDefinition{
+		Name:       "invalid",
+		Parameters: map[string]any{"unsupported": func() {}},
+	}}, func(context.Context, string, struct{}, func(ToolUpdate)) (*ToolOutput, error) {
+		return nil, nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "snapshot tool definition") {
+		t.Fatalf("NewTool error = %v", err)
+	}
+	if tool != nil {
+		t.Fatalf("NewTool returned tool with invalid definition: %#v", tool)
+	}
+}
 
-	// Intentionally use SetOptions as a value-less statement: this is the
-	// original public API shape retained for existing callers.
-	a.SetOptions(ai.StreamOptions{Extra: map[string]any{"bad": func() {}}})
+func TestNewTerminalToolReturnsDefinitionSnapshotErrorAtConstruction(t *testing.T) {
+	tool, err := NewTerminalTool[struct{}](ToolDefinition{ToolDefinition: ai.ToolDefinition{
+		Name:       "invalid_terminal",
+		Parameters: map[string]any{"unsupported": func() {}},
+	}})
+	if err == nil || !strings.Contains(err.Error(), "snapshot tool definition") {
+		t.Fatalf("NewTerminalTool error = %v", err)
+	}
+	if tool != nil {
+		t.Fatalf("NewTerminalTool returned tool with invalid definition: %#v", tool)
+	}
+}
+
+func TestSetOptionsReturnsSnapshotErrorWithoutChangingConfiguration(t *testing.T) {
+	temperature := 0.25
+	llm := &fakeLLM{script: []*ai.AssistantMessage{assistantText("done")}}
+	a := newAgent(t, Config{
+		LLM:      llm,
+		Provider: "p",
+		Model:    "m",
+		Options:  ai.StreamOptions{Temperature: &temperature},
+	})
+
+	err := a.SetOptions(ai.StreamOptions{Extra: map[string]any{"bad": func() {}}})
+	if err == nil || !strings.Contains(err.Error(), "SetOptions") {
+		t.Fatalf("SetOptions error = %v", err)
+	}
+
 	stream, err := a.PromptText(context.Background(), "first")
 	if err != nil {
 		t.Fatalf("PromptText: %v", err)
 	}
 	_, result, err := drainRun(t, stream)
-	if err != nil || result.Err == nil || !strings.Contains(result.Err.Error(), "SetOptions") {
+	if err != nil || result.Err != nil {
 		t.Fatalf("run errors = %v / %v", err, result.Err)
 	}
-	if llm.callCount() != 0 {
-		t.Fatalf("LLM calls = %d, want 0 for invalid snapshotted options", llm.callCount())
-	}
-
-	a.SetOptions(ai.StreamOptions{})
-	stream, err = a.Continue(context.Background())
-	if err != nil {
-		t.Fatalf("Continue: %v", err)
-	}
-	_, result, err = drainRun(t, stream)
-	if err != nil || result.Err != nil {
-		t.Fatalf("recovered run errors = %v / %v", err, result.Err)
+	if got := llm.optionsAt(0).Temperature; got == nil || *got != 0.25 {
+		t.Fatalf("options changed after rejected update: %#v", llm.optionsAt(0))
 	}
 }

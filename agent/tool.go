@@ -83,13 +83,6 @@ type sequentialTool struct{ Tool }
 
 func (sequentialTool) sequentialOnly() bool { return true }
 
-func (t sequentialTool) definitionSnapshotError() error {
-	if source, ok := t.Tool.(interface{ definitionSnapshotError() error }); ok {
-		return source.definitionSnapshotError()
-	}
-	return nil
-}
-
 // Sequential marks a tool as unsafe for concurrent execution.
 func Sequential(t Tool) Tool { return sequentialTool{t} }
 
@@ -99,29 +92,20 @@ func isSequentialOnly(t Tool) bool {
 }
 
 // NewTool adapts a typed handler into a Tool. The definition is frozen by its
-// JSON representation at construction; an invalid schema becomes an agent
-// configuration error before dispatch. Arguments are decoded into P via a
-// JSON round-trip; a decode failure is returned as an error, which the loop
-// reports to the model as an IsError toolResult so it can fix its arguments
-// and retry — it never aborts the run.
+// JSON representation at construction; an invalid schema is returned as a
+// construction error. Arguments are decoded into P via a JSON round-trip; a
+// decode failure is returned as an error, which the loop reports to the model
+// as an IsError toolResult so it can fix its arguments and retry — it never
+// aborts the run.
 func NewTool[P any](def ToolDefinition,
 	fn func(ctx context.Context, toolCallID string, params P, onUpdate func(ToolUpdate)) (*ToolOutput, error),
-) Tool {
+) (Tool, error) {
 	frozen, err := ai.SnapshotToolDefinition(def.ToolDefinition)
-	if err == nil {
-		def.ToolDefinition = frozen
-	} else {
-		// Retain only immutable display fields. The captured error is surfaced
-		// before the tool is included in a prompt, so invalid schema state can
-		// never leak onto the wire.
-		def.ToolDefinition.Parameters = nil
-	}
 	if err != nil {
-		// Do not retain json.UnsupportedValueError.Value, which can point back
-		// into the caller's rejected schema graph.
-		err = fmt.Errorf("%s", err)
+		return nil, fmt.Errorf("agent: snapshot tool definition: %w", err)
 	}
-	return &typedTool[P]{def: def, definitionErr: err, fn: fn}
+	def.ToolDefinition = frozen
+	return &typedTool[P]{def: def, fn: fn}, nil
 }
 
 // NewTerminalTool creates a typed output tool whose arguments are the run's
@@ -132,7 +116,7 @@ func NewTool[P any](def ToolDefinition,
 // The terminal value takes effect only when the whole tool-call batch
 // terminates, matching ToolOutput.Terminate semantics. The model should
 // therefore call a terminal tool by itself.
-func NewTerminalTool[P any](def ToolDefinition) Tool {
+func NewTerminalTool[P any](def ToolDefinition) (Tool, error) {
 	return NewTool[P](def,
 		func(_ context.Context, _ string, params P, _ func(ToolUpdate)) (*ToolOutput, error) {
 			return &ToolOutput{
@@ -144,19 +128,11 @@ func NewTerminalTool[P any](def ToolDefinition) Tool {
 }
 
 type typedTool[P any] struct {
-	def           ToolDefinition
-	definitionErr error
-	fn            func(ctx context.Context, toolCallID string, params P, onUpdate func(ToolUpdate)) (*ToolOutput, error)
+	def ToolDefinition
+	fn  func(ctx context.Context, toolCallID string, params P, onUpdate func(ToolUpdate)) (*ToolOutput, error)
 }
 
 func (t *typedTool[P]) Definition() ToolDefinition { return cloneToolDefinition(t.def) }
-
-func (t *typedTool[P]) definitionSnapshotError() error {
-	if t.definitionErr == nil {
-		return nil
-	}
-	return fmt.Errorf("agent: snapshot tool definition: %w", t.definitionErr)
-}
 
 func (t *typedTool[P]) Execute(ctx context.Context, toolCallID string, args map[string]any,
 	onUpdate func(ToolUpdate)) (*ToolOutput, error) {

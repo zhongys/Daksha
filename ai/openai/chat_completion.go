@@ -53,7 +53,11 @@ func (r *ChatCompletionService) newStreaming(ctx context.Context, body any, opts
 	)
 	preClientOpts := []RequestOption{WithBearerAuthSecurity()}
 	opts = slices.Concat(preClientOpts, r.Options, opts)
-	opts = append(opts, WithJSONSet("stream", true), WithHeader("Accept", "text/event-stream"))
+	streamOption, err := WithJSONSet("stream", true)
+	if err != nil {
+		return NewStream[ChatCompletionChunk](nil, err)
+	}
+	opts = append(opts, streamOption, WithHeader("Accept", "text/event-stream"))
 	path := "chat/completions"
 	err = ExecuteNewRequest(ctx, http.MethodPost, path, body, &raw, opts...)
 	if err != nil {

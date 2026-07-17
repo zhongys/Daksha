@@ -36,7 +36,7 @@ func TestCancellationStopsSequentialBatchBeforeNextTool(t *testing.T) {
 			firstReturned := make(chan struct{})
 			var secondExecutions atomic.Int32
 
-			first := NewTool(ToolDefinition{ToolDefinition: ai.ToolDefinition{Name: "first"}},
+			first := mustNewTool(t, ToolDefinition{ToolDefinition: ai.ToolDefinition{Name: "first"}},
 				func(ctx context.Context, _ string, _ struct{}, onUpdate func(ToolUpdate)) (*ToolOutput, error) {
 					close(firstEntered)
 					<-ctx.Done()
@@ -48,7 +48,7 @@ func TestCancellationStopsSequentialBatchBeforeNextTool(t *testing.T) {
 					close(firstReturned)
 					return nil, ctx.Err()
 				})
-			second := NewTool(ToolDefinition{ToolDefinition: ai.ToolDefinition{Name: "second"}},
+			second := mustNewTool(t, ToolDefinition{ToolDefinition: ai.ToolDefinition{Name: "second"}},
 				func(context.Context, string, struct{}, func(ToolUpdate)) (*ToolOutput, error) {
 					secondExecutions.Add(1)
 					return &ToolOutput{}, nil
@@ -137,7 +137,7 @@ func TestCancellationStopsSequentialBatchBeforeNextTool(t *testing.T) {
 func TestAbortInsideBeforeToolCallStopsParallelBatch(t *testing.T) {
 	var executions atomic.Int32
 	mkTool := func(name string) Tool {
-		return NewTool(ToolDefinition{ToolDefinition: ai.ToolDefinition{Name: name}},
+		return mustNewTool(t, ToolDefinition{ToolDefinition: ai.ToolDefinition{Name: name}},
 			func(context.Context, string, struct{}, func(ToolUpdate)) (*ToolOutput, error) {
 				executions.Add(1)
 				return &ToolOutput{}, nil

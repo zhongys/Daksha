@@ -75,7 +75,6 @@ type Agent struct {
 	systemPrompt  string
 	tools         []Tool
 	options       ai.StreamOptions
-	optionsErr    error
 	toolExecution ExecutionMode
 	maxTurns      int
 
@@ -340,33 +339,15 @@ func (a *Agent) SetTools(tools []Tool) {
 	a.tools = append([]Tool(nil), tools...)
 }
 
-// SetOptions preserves the original setter API. Invalid reference-backed
-// values are remembered as a configuration error and make the next run fail
-// before dispatch instead of retaining caller-owned input.
-func (a *Agent) SetOptions(opts ai.StreamOptions) {
-	snapshot, err := ai.SnapshotStreamOptions(opts)
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if err != nil {
-		// Store only immutable text: encoding/json errors may retain a
-		// reflect.Value pointing into the rejected caller-owned tree.
-		a.optionsErr = fmt.Errorf("agent: SetOptions: %s", err)
-		return
-	}
-	a.options = snapshot
-	a.optionsErr = nil
-}
-
-// SetOptionsChecked snapshots per-turn options and reports invalid JSON-backed
-// values immediately. On error the existing configuration is unchanged.
-func (a *Agent) SetOptionsChecked(opts ai.StreamOptions) error {
+// SetOptions snapshots per-turn options. On error the existing configuration
+// is unchanged.
+func (a *Agent) SetOptions(opts ai.StreamOptions) error {
 	snapshot, err := ai.SnapshotStreamOptions(opts)
 	if err != nil {
-		return fmt.Errorf("agent: SetOptionsChecked: %w", err)
+		return fmt.Errorf("agent: SetOptions: %w", err)
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.options = snapshot
-	a.optionsErr = nil
 	return nil
 }
