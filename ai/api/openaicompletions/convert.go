@@ -22,7 +22,7 @@ type resolvedCompat struct {
 
 func detectCompat(baseURL string) resolvedCompat {
 	isDeepSeek := strings.Contains(baseURL, "deepseek.com")
-	isQwen := strings.Contains(baseURL, "dashscope")
+	isQwen := strings.Contains(baseURL, "maas.aliyuncs.com")
 	isOpenRouter := strings.Contains(baseURL, "openrouter.ai")
 	isZai := strings.Contains(baseURL, "bigmodel.cn") || strings.Contains(baseURL, "api.z.ai")
 	isMoonshot := strings.Contains(baseURL, "api.moonshot.")
