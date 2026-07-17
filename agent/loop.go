@@ -17,30 +17,47 @@ type runConfig struct {
 	model         string
 	systemPrompt  string
 	tools         []Tool
+	definitions   []ai.ToolDefinition
 	options       ai.StreamOptions
+	optionsErr    error
 	toolExecution ExecutionMode
 	maxTurns      int
 }
 
-func (a *Agent) snapshotConfig() runConfig {
+func (a *Agent) snapshotConfig() (runConfig, error) {
 	a.mu.RLock()
-	defer a.mu.RUnlock()
-	return runConfig{
+	config := runConfig{
 		llm:           a.llm,
 		provider:      a.provider,
 		model:         a.model,
 		systemPrompt:  a.systemPrompt,
 		tools:         append([]Tool(nil), a.tools...),
 		options:       a.options,
+		optionsErr:    a.optionsErr,
 		toolExecution: a.toolExecution,
 		maxTurns:      a.maxTurns,
 	}
+	a.mu.RUnlock()
+	if config.optionsErr != nil {
+		return runConfig{}, config.optionsErr
+	}
+
+	// SnapshotStreamOptions may invoke a custom JSON marshaler. Never execute
+	// caller code while holding the agent mutex: it may call a setter itself.
+	options, err := ai.SnapshotStreamOptions(config.options)
+	if err != nil {
+		return runConfig{}, fmt.Errorf("agent: snapshot options: %w", err)
+	}
+	config.options = options
+	return config, nil
 }
 
-func (a *Agent) appendMessage(m ai.Message) {
+func (a *Agent) appendMessage(m ai.Message) ai.Message {
+	owned := cloneMessage(m)
 	a.mu.Lock()
-	a.messages = append(a.messages, m)
+	a.messages = append(a.messages, owned)
 	a.mu.Unlock()
+	return owned
 }
 
 func (a *Agent) drainSteering() []ai.Message {
@@ -82,7 +99,8 @@ func (e *emitter) publish(ev Event) bool {
 // announce emits the start/end pair for a message that arrives whole
 // (user, toolResult) — the application's incremental persistence hook.
 func (e *emitter) announce(m ai.Message) bool {
-	return e.publish(MessageStartEvent{Message: m}) && e.publish(MessageEndEvent{Message: m})
+	return e.publish(MessageStartEvent{Message: cloneMessage(m)}) &&
+		e.publish(MessageEndEvent{Message: cloneMessage(m)})
 }
 
 func (e *emitter) failure() error {
@@ -107,8 +125,8 @@ func (a *Agent) run(ctx context.Context, cancel context.CancelFunc, runID uint64
 	var runErr error
 
 	record := func(m ai.Message) {
-		a.appendMessage(m)
-		newMessages = append(newMessages, m)
+		owned := a.appendMessage(m)
+		newMessages = append(newMessages, owned)
 	}
 
 	em.publish(AgentStartEvent{})
@@ -117,16 +135,23 @@ func (a *Agent) run(ctx context.Context, cancel context.CancelFunc, runID uint64
 		em.announce(m)
 	}
 
-	cfg := a.snapshotConfig()
+	cfg, err := a.snapshotConfig()
+	if err != nil {
+		runErr = err
+	}
 
-	for turn := 1; em.err == nil; turn++ {
+	for turn := 1; em.err == nil && runErr == nil; turn++ {
 		if cfg.maxTurns > 0 && turn > cfg.maxTurns {
 			runErr = fmt.Errorf("agent: max turns (%d) exceeded", cfg.maxTurns)
 			break
 		}
 		em.publish(TurnStartEvent{Turn: turn})
 
-		cfg = a.snapshotConfig()
+		cfg, err = a.snapshotConfig()
+		if err != nil {
+			runErr = err
+			break
+		}
 		msgs := a.Messages()
 		if a.transformContext != nil {
 			var err error
@@ -135,11 +160,20 @@ func (a *Agent) run(ctx context.Context, cancel context.CancelFunc, runID uint64
 				break
 			}
 		}
+		cfg.definitions, err = definitions(cfg.tools)
+		if err != nil {
+			runErr = err
+			break
+		}
 
-		prompt := ai.Prompt{
+		prompt, err := ai.SnapshotPrompt(ai.Prompt{
 			System:   cfg.systemPrompt,
 			Messages: msgs,
-			Tools:    definitions(cfg.tools),
+			Tools:    cfg.definitions,
+		})
+		if err != nil {
+			runErr = fmt.Errorf("agent: snapshot prompt: %w", err)
+			break
 		}
 		stream := cfg.llm.Stream(ctx, cfg.provider, cfg.model, prompt, cfg.options)
 		for ev := range stream.Events() {
@@ -184,7 +218,7 @@ func (a *Agent) run(ctx context.Context, cancel context.CancelFunc, runID uint64
 			}
 		}
 		em.publish(TurnEndEvent{
-			Turn: turn, Message: ai.CloneAssistantMessage(final), ToolResults: toolResults,
+			Turn: turn, Message: ai.CloneAssistantMessage(final), ToolResults: cloneMessages(toolResults),
 		})
 		if toolErr != nil {
 			runErr = toolErr
@@ -227,7 +261,7 @@ func (a *Agent) run(ctx context.Context, cancel context.CancelFunc, runID uint64
 	if runErr == nil && em.err != nil {
 		runErr = em.err
 	}
-	em.publish(AgentEndEvent{NewMessages: cloneMessages(newMessages), Output: runOutput})
+	em.publish(AgentEndEvent{NewMessages: cloneMessages(newMessages), Output: cloneRunOutput(runOutput)})
 	// Result() must imply that the agent is ready for its next run. Retire
 	// before Complete makes the result visible; the run identity protects a
 	// new run from the deferred cleanup above.
@@ -235,7 +269,7 @@ func (a *Agent) run(ctx context.Context, cancel context.CancelFunc, runID uint64
 	_ = producer.Complete(ctx, &RunResult{
 		NewMessages: cloneMessages(newMessages),
 		Last:        ai.CloneAssistantMessage(last),
-		Output:      runOutput,
+		Output:      cloneRunOutput(runOutput),
 		Err:         runErr,
 	})
 }
@@ -266,8 +300,8 @@ func (a *Agent) executeTools(ctx context.Context, em *emitter, cfg runConfig,
 	}
 
 	byName := map[string]Tool{}
-	for _, t := range cfg.tools {
-		byName[t.Definition().Name] = t
+	for i, t := range cfg.tools {
+		byName[cfg.definitions[i].Name] = t
 	}
 
 	sequential := cfg.toolExecution != ExecParallel
@@ -313,7 +347,8 @@ func (a *Agent) executeTools(ctx context.Context, em *emitter, cfg runConfig,
 		if _, known := byName[o.call.Name]; !known {
 			o.msg = errorResult(o.call, fmt.Errorf("agent: unknown tool %q", o.call.Name))
 			em.publish(ToolExecutionEndEvent{
-				ToolCallID: o.call.Id, ToolName: o.call.Name, Result: o.msg, IsError: true,
+				ToolCallID: o.call.Id, ToolName: o.call.Name,
+				Result: cloneMessage(o.msg), IsError: true,
 			})
 			return false
 		}
@@ -334,7 +369,8 @@ func (a *Agent) executeTools(ctx context.Context, em *emitter, cfg runConfig,
 			if err != nil {
 				o.msg = errorResult(o.call, fmt.Errorf("agent: tool call blocked: %w", err))
 				em.publish(ToolExecutionEndEvent{
-					ToolCallID: o.call.Id, ToolName: o.call.Name, Result: o.msg, IsError: true,
+					ToolCallID: o.call.Id, ToolName: o.call.Name,
+					Result: cloneMessage(o.msg), IsError: true,
 				})
 				return false
 			}
@@ -355,7 +391,9 @@ func (a *Agent) executeTools(ctx context.Context, em *emitter, cfg runConfig,
 			if ctx.Err() != nil {
 				return
 			}
-			em.publish(ToolExecutionUpdateEvent{ToolCallID: o.call.Id, ToolName: o.call.Name, Update: u})
+			em.publish(ToolExecutionUpdateEvent{
+				ToolCallID: o.call.Id, ToolName: o.call.Name, Update: cloneToolUpdate(u),
+			})
 		}
 		if !a.claimToolStart(ctx) {
 			finalizeSkipped(o, ctx.Err())
@@ -372,12 +410,13 @@ func (a *Agent) executeTools(ctx context.Context, em *emitter, cfg runConfig,
 				o.output = &RunOutput{
 					ToolCallID: o.call.Id,
 					ToolName:   o.call.Name,
-					Value:      out.terminal.value,
+					Value:      cloneApplicationDetails(out.terminal.value),
 				}
 			}
 		}
 		em.publish(ToolExecutionEndEvent{
-			ToolCallID: o.call.Id, ToolName: o.call.Name, Result: o.msg, IsError: o.msg.IsError,
+			ToolCallID: o.call.Id, ToolName: o.call.Name,
+			Result: cloneMessage(o.msg), IsError: o.msg.IsError,
 		})
 	}
 
@@ -423,9 +462,9 @@ func (a *Agent) executeTools(ctx context.Context, em *emitter, cfg runConfig,
 	terminate := true
 	var outputs []*RunOutput
 	for _, o := range outcomes {
-		a.appendMessage(o.msg)
-		em.announce(o.msg)
-		results = append(results, o.msg)
+		owned := a.appendMessage(o.msg)
+		em.announce(owned)
+		results = append(results, owned)
 		if !o.terminate {
 			terminate = false
 		}
@@ -468,24 +507,30 @@ func successResult(call *ai.ToolCallContent, out *ToolOutput) *ai.ToolResultMess
 		Timestamp:  time.Now().UnixMilli(),
 	}
 	if out != nil {
-		msg.Content = out.Content
+		msg.Content = cloneToolResultContents(out.Content)
 		if out.Details != nil {
-			details := out.Details
+			details := cloneApplicationDetails(out.Details)
 			msg.Details = &details
 		}
 	}
 	return msg
 }
 
-func definitions(tools []Tool) []ai.ToolDefinition {
+func definitions(tools []Tool) ([]ai.ToolDefinition, error) {
 	if len(tools) == 0 {
-		return nil
+		return nil, nil
 	}
 	defs := make([]ai.ToolDefinition, 0, len(tools))
 	for _, t := range tools {
-		defs = append(defs, t.Definition().ToolDefinition)
+		if source, ok := t.(interface{ definitionSnapshotError() error }); ok {
+			if err := source.definitionSnapshotError(); err != nil {
+				return nil, err
+			}
+		}
+		definition := t.Definition().ToolDefinition
+		defs = append(defs, ai.CloneToolDefinition(definition))
 	}
-	return defs
+	return defs, nil
 }
 
 // partialOf extracts the partial assistant message carried by every ai

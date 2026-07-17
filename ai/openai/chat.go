@@ -9,7 +9,7 @@ type ChatService struct {
 
 func NewChatService(opts ...RequestOption) (r ChatService) {
 	r = ChatService{}
-	r.Options = opts
+	r.Options = append([]RequestOption(nil), opts...)
 	r.Completions = NewChatCompletionService(opts...)
 	return
 }

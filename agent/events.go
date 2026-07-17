@@ -106,7 +106,8 @@ func (ToolExecutionEndEvent) EventType() EventType { return EventToolExecutionEn
 
 // RunOutput is the value accepted by a dedicated terminal tool. Value retains
 // the concrete parameter type P supplied to NewTerminalTool[P]; ToolCallID and
-// ToolName identify the model call that produced it.
+// ToolName identify the model call that produced it. Event and RunResult
+// outputs are independent structural snapshots.
 type RunOutput struct {
 	ToolCallID string
 	ToolName   string

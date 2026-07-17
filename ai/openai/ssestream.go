@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -36,10 +37,15 @@ type Event struct {
 type StreamError struct {
 	Message string
 	Event   Event
+	Cause   error
 }
 
 func (e *StreamError) Error() string {
 	return e.Message
+}
+
+func (e *StreamError) Unwrap() error {
+	return e.Cause
 }
 
 // A base implementation of a Decoder for text/event-stream.
@@ -163,25 +169,55 @@ func (s *Stream[T]) Next() bool {
 	if s.err != nil || s.done {
 		return false
 	}
+	if s.decoder == nil {
+		s.err = errors.New("openai: streaming response has no decoder")
+		return false
+	}
 
 	for s.decoder.Next() {
-		data := s.decoder.Event().Data
+		event := cloneEvent(s.decoder.Event())
+		data := event.Data
+
+		// An explicit SSE error event is terminal even when its payload is a
+		// flat error object rather than the usual {"error": {...}} envelope.
+		// Check the event name before [DONE] so `event: error` can never be
+		// disguised as a clean terminator.
+		if event.Type == "error" {
+			apiErr := errorFromEventData(data)
+			if apiErr == nil {
+				apiErr = parseAPIErrorData(data, true)
+				apiErr.Body = string(data)
+			}
+			if apiErr.Message == "" {
+				apiErr.Message = "stream emitted an error event"
+			}
+			s.err = newAPIStreamError(event, apiErr)
+			return false
+		}
+
 		if bytes.Equal(bytes.TrimSuffix(data, []byte("\n")), []byte("[DONE]")) {
 			s.done = true
 			return false
 		}
 
 		if apiErr := errorFromEventData(data); apiErr != nil {
-			s.err = &StreamError{
-				Message: fmt.Sprintf("received error while streaming: %s", apiErr.Message),
-				Event:   s.decoder.Event(),
-			}
+			s.err = newAPIStreamError(event, apiErr)
+			return false
+		}
+
+		trimmed := bytes.TrimSpace(data)
+		if len(trimmed) == 0 {
+			s.err = newDecodeStreamError(event, errors.New("empty streaming event data"))
+			return false
+		}
+		if bytes.Equal(trimmed, []byte("null")) {
+			s.err = newDecodeStreamError(event, errors.New("null streaming event data"))
 			return false
 		}
 
 		var nxt T
-		s.err = json.Unmarshal(data, &nxt)
-		if s.err != nil {
+		if err := json.Unmarshal(data, &nxt); err != nil {
+			s.err = newDecodeStreamError(event, err)
 			return false
 		}
 		s.cur = nxt
@@ -208,4 +244,25 @@ func (s *Stream[T]) Close() error {
 		return nil
 	}
 	return s.decoder.Close()
+}
+
+func cloneEvent(event Event) Event {
+	event.Data = append([]byte(nil), event.Data...)
+	return event
+}
+
+func newAPIStreamError(event Event, apiErr *APIError) *StreamError {
+	return &StreamError{
+		Message: fmt.Sprintf("received error while streaming: %s", apiErr.Message),
+		Event:   event,
+		Cause:   apiErr,
+	}
+}
+
+func newDecodeStreamError(event Event, cause error) *StreamError {
+	return &StreamError{
+		Message: fmt.Sprintf("failed to decode streaming event: %v", cause),
+		Event:   event,
+		Cause:   cause,
+	}
 }

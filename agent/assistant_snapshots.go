@@ -6,22 +6,42 @@ import (
 	"github.com/zhongys/Daksha/ai"
 )
 
-// cloneMessages detaches assistant messages, whose tool-call argument maps are
-// the mutable values relevant to execution. Other message variants are kept as
-// values in a new slice; the agent never derives executable input from them.
+func cloneMessage(message ai.Message) ai.Message {
+	return ai.CloneMessage(message)
+}
+
+// cloneMessages detaches every protocol-visible content block. User and tool
+// result messages are model input too, so retaining their pointers would let
+// callers, callbacks or event consumers rewrite agent history.
 func cloneMessages(messages []ai.Message) []ai.Message {
-	if messages == nil {
+	return ai.CloneMessages(messages)
+}
+
+func cloneToolResultContents(contents []ai.ToolResultContent) []ai.ToolResultContent {
+	message := &ai.ToolResultMessage[struct{}]{Content: contents}
+	return ai.CloneMessage(message).(*ai.ToolResultMessage[struct{}]).Content
+}
+
+func cloneToolUpdate(update ToolUpdate) ToolUpdate {
+	update.Content = cloneToolResultContents(update.Content)
+	update.Details = cloneApplicationDetails(update.Details)
+	return update
+}
+
+func cloneApplicationDetails(details any) any {
+	value := details
+	message := &ai.ToolResultMessage[any]{Details: &value}
+	cloned := ai.CloneMessage(message).(*ai.ToolResultMessage[any])
+	return *cloned.Details
+}
+
+func cloneRunOutput(output *RunOutput) *RunOutput {
+	if output == nil {
 		return nil
 	}
-	cloned := make([]ai.Message, len(messages))
-	for i, message := range messages {
-		if assistant, ok := message.(*ai.AssistantMessage); ok {
-			cloned[i] = ai.CloneAssistantMessage(assistant)
-			continue
-		}
-		cloned[i] = message
-	}
-	return cloned
+	cloned := *output
+	cloned.Value = cloneApplicationDetails(output.Value)
+	return &cloned
 }
 
 // cloneAssistantEvent keeps the provider stream's event snapshot private from

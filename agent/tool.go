@@ -23,6 +23,8 @@ const (
 // as a tool_execution_update event.
 type ToolUpdate struct {
 	Content []ai.ToolResultContent
+	// Details follows ToolResultMessage.Details ownership rules. Ordinary
+	// structural data is snapshotted before the update event is published.
 	Details any
 }
 
@@ -30,7 +32,8 @@ type ToolUpdate struct {
 type ToolOutput struct {
 	Content []ai.ToolResultContent
 	// Details is app-specific structured data stored on the tool result
-	// message; the LLM never sees it.
+	// message; the LLM never sees it. Execute transfers ownership when it
+	// returns; ordinary structural data is snapshotted before publication.
 	Details any
 	// Terminate hints that the loop should skip the automatic follow-up LLM
 	// call. It only takes effect when every finalized result in the batch
@@ -68,12 +71,24 @@ type ToolDefinition struct {
 	Label string
 }
 
+func cloneToolDefinition(definition ToolDefinition) ToolDefinition {
+	definition.ToolDefinition = ai.CloneToolDefinition(definition.ToolDefinition)
+	return definition
+}
+
 // sequentialTool is the optional marker read by the loop: if any tool call
 // in a batch targets a tool wrapped with Sequential, the whole batch runs
 // sequentially regardless of the agent-level mode.
 type sequentialTool struct{ Tool }
 
 func (sequentialTool) sequentialOnly() bool { return true }
+
+func (t sequentialTool) definitionSnapshotError() error {
+	if source, ok := t.Tool.(interface{ definitionSnapshotError() error }); ok {
+		return source.definitionSnapshotError()
+	}
+	return nil
+}
 
 // Sequential marks a tool as unsafe for concurrent execution.
 func Sequential(t Tool) Tool { return sequentialTool{t} }
@@ -83,14 +98,30 @@ func isSequentialOnly(t Tool) bool {
 	return ok
 }
 
-// NewTool adapts a typed handler into a Tool. Arguments are decoded into P
-// via a JSON round-trip; a decode failure is returned as an error, which the
-// loop reports to the model as an IsError toolResult so it can fix its
-// arguments and retry — it never aborts the run.
+// NewTool adapts a typed handler into a Tool. The definition is frozen by its
+// JSON representation at construction; an invalid schema becomes an agent
+// configuration error before dispatch. Arguments are decoded into P via a
+// JSON round-trip; a decode failure is returned as an error, which the loop
+// reports to the model as an IsError toolResult so it can fix its arguments
+// and retry — it never aborts the run.
 func NewTool[P any](def ToolDefinition,
 	fn func(ctx context.Context, toolCallID string, params P, onUpdate func(ToolUpdate)) (*ToolOutput, error),
 ) Tool {
-	return &typedTool[P]{def: def, fn: fn}
+	frozen, err := ai.SnapshotToolDefinition(def.ToolDefinition)
+	if err == nil {
+		def.ToolDefinition = frozen
+	} else {
+		// Retain only immutable display fields. The captured error is surfaced
+		// before the tool is included in a prompt, so invalid schema state can
+		// never leak onto the wire.
+		def.ToolDefinition.Parameters = nil
+	}
+	if err != nil {
+		// Do not retain json.UnsupportedValueError.Value, which can point back
+		// into the caller's rejected schema graph.
+		err = fmt.Errorf("%s", err)
+	}
+	return &typedTool[P]{def: def, definitionErr: err, fn: fn}
 }
 
 // NewTerminalTool creates a typed output tool whose arguments are the run's
@@ -113,11 +144,19 @@ func NewTerminalTool[P any](def ToolDefinition) Tool {
 }
 
 type typedTool[P any] struct {
-	def ToolDefinition
-	fn  func(ctx context.Context, toolCallID string, params P, onUpdate func(ToolUpdate)) (*ToolOutput, error)
+	def           ToolDefinition
+	definitionErr error
+	fn            func(ctx context.Context, toolCallID string, params P, onUpdate func(ToolUpdate)) (*ToolOutput, error)
 }
 
-func (t *typedTool[P]) Definition() ToolDefinition { return t.def }
+func (t *typedTool[P]) Definition() ToolDefinition { return cloneToolDefinition(t.def) }
+
+func (t *typedTool[P]) definitionSnapshotError() error {
+	if t.definitionErr == nil {
+		return nil
+	}
+	return fmt.Errorf("agent: snapshot tool definition: %w", t.definitionErr)
+}
 
 func (t *typedTool[P]) Execute(ctx context.Context, toolCallID string, args map[string]any,
 	onUpdate func(ToolUpdate)) (*ToolOutput, error) {

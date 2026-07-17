@@ -18,12 +18,21 @@ import (
 type fakeLLM struct {
 	mu      sync.Mutex
 	prompts []ai.Prompt
+	options []ai.StreamOptions
 	script  []*ai.AssistantMessage
 	block   chan struct{} // when set, responses wait for it (or ctx)
 }
 
 type jsonEventLLM struct {
 	raw json.RawMessage
+}
+
+type privateSchemaMarshaler struct {
+	values map[string]any
+}
+
+func (s *privateSchemaMarshaler) MarshalJSON() ([]byte, error) {
+	return json.Marshal(s.values)
 }
 
 func (f *jsonEventLLM) Stream(ctx context.Context, _, _ string, _ ai.Prompt,
@@ -62,6 +71,7 @@ func (f *fakeLLM) Stream(ctx context.Context, provider, model string, prompt ai.
 	f.mu.Lock()
 	idx := len(f.prompts)
 	f.prompts = append(f.prompts, prompt)
+	f.options = append(f.options, opts)
 	var msg *ai.AssistantMessage
 	if idx < len(f.script) {
 		msg = f.script[idx]
@@ -98,6 +108,12 @@ func (f *fakeLLM) promptAt(i int) ai.Prompt {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.prompts[i]
+}
+
+func (f *fakeLLM) optionsAt(i int) ai.StreamOptions {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.options[i]
 }
 
 func assistantText(text string) *ai.AssistantMessage {
@@ -586,8 +602,54 @@ func TestTerminalToolReturnsTypedRunOutput(t *testing.T) {
 			endOutput = end.Output
 		}
 	}
-	if endOutput != res.Output {
-		t.Fatalf("AgentEnd output = %#v, result output = %#v", endOutput, res.Output)
+	if endOutput == nil || endOutput == res.Output {
+		t.Fatalf("AgentEnd output is not an independent snapshot: event=%#v result=%#v", endOutput, res.Output)
+	}
+	if endValue, ok := RunOutputAs[finalAnswer](endOutput); !ok || endValue != value {
+		t.Fatalf("AgentEnd output value = %#v, want %#v", endOutput.Value, value)
+	}
+}
+
+func TestTerminalOutputAndDetailsAreIndependentSnapshots(t *testing.T) {
+	tool := NewTerminalTool[map[string]any](ToolDefinition{ToolDefinition: ai.ToolDefinition{
+		Name: "mutable_output", Parameters: map[string]any{"type": "object"},
+	}})
+	llm := &fakeLLM{script: []*ai.AssistantMessage{
+		assistantToolCalls(toolCall("c1", "mutable_output", map[string]any{
+			"nested": map[string]any{"value": "original"},
+		})),
+	}}
+	a := newAgent(t, Config{LLM: llm, Provider: "p", Model: "m", Tools: []Tool{tool}})
+
+	stream, _ := a.PromptText(context.Background(), "finish")
+	events, result, err := drainRun(t, stream)
+	if err != nil || result.Err != nil {
+		t.Fatalf("run errors = %v / %v", err, result.Err)
+	}
+	var eventOutput *RunOutput
+	for _, event := range events {
+		if end, ok := event.(AgentEndEvent); ok {
+			eventOutput = end.Output
+		}
+	}
+	if eventOutput == nil || result.Output == nil || eventOutput == result.Output {
+		t.Fatalf("outputs are not independent: event=%#v result=%#v", eventOutput, result.Output)
+	}
+
+	resultValue, _ := RunOutputAs[map[string]any](result.Output)
+	eventValue, _ := RunOutputAs[map[string]any](eventOutput)
+	resultValue["nested"].(map[string]any)["value"] = "changed result"
+	if got := eventValue["nested"].(map[string]any)["value"]; got != "original" {
+		t.Fatalf("result output rewrote event output: %#v", got)
+	}
+
+	resultMessage := result.NewMessages[2].(*ai.ToolResultMessage[any])
+	resultDetails := (*resultMessage.Details).(map[string]any)
+	resultDetails["nested"].(map[string]any)["value"] = "changed result message"
+	historyMessage := a.Messages()[2].(*ai.ToolResultMessage[any])
+	historyDetails := (*historyMessage.Details).(map[string]any)
+	if got := historyDetails["nested"].(map[string]any)["value"]; got != "original" {
+		t.Fatalf("run result rewrote history details: %#v", got)
 	}
 }
 
@@ -784,5 +846,213 @@ func TestTransformContext(t *testing.T) {
 	// The transform only shapes what the LLM sees; the context keeps everything.
 	if got := len(a.Messages()); got != 5 {
 		t.Fatalf("context = %d messages, want 5", got)
+	}
+}
+
+func TestAgentMessageOwnershipAcrossPromptEventsResultsAndHistory(t *testing.T) {
+	llm := &fakeLLM{script: []*ai.AssistantMessage{assistantText("done")}}
+	a := newAgent(t, Config{LLM: llm, Provider: "p", Model: "m"})
+	input := UserText("original")
+	stream, err := a.Prompt(context.Background(), input)
+	if err != nil {
+		t.Fatalf("Prompt: %v", err)
+	}
+	input.Content[0].(*ai.TextContent).Text = "changed caller"
+	events, result, err := drainRun(t, stream)
+	if err != nil || result.Err != nil {
+		t.Fatalf("run errors = %v / %v", err, result.Err)
+	}
+	if got := llm.promptAt(0).Messages[0].(*ai.UserMessage).Content[0].(*ai.TextContent).Text; got != "original" {
+		t.Fatalf("LLM prompt text = %q", got)
+	}
+
+	for _, event := range events {
+		switch event := event.(type) {
+		case MessageStartEvent:
+			if message, ok := event.Message.(*ai.UserMessage); ok {
+				message.Content[0].(*ai.TextContent).Text = "changed event"
+			}
+		case MessageEndEvent:
+			if message, ok := event.Message.(*ai.UserMessage); ok {
+				message.Content[0].(*ai.TextContent).Text = "changed event"
+			}
+		}
+	}
+	result.NewMessages[0].(*ai.UserMessage).Content[0].(*ai.TextContent).Text = "changed result"
+	llm.promptAt(0).Messages[0].(*ai.UserMessage).Content[0].(*ai.TextContent).Text = "changed adapter"
+	if got := a.Messages()[0].(*ai.UserMessage).Content[0].(*ai.TextContent).Text; got != "original" {
+		t.Fatalf("history text changed through an ownership boundary: %q", got)
+	}
+
+	toolDetails := map[string]any{"nested": map[string]any{"value": "details original"}}
+	toolResult := &ai.ToolResultMessage[map[string]any]{
+		Role: ai.RoleToolResult, ToolCallId: "call_1",
+		Content: []ai.ToolResultContent{&ai.TextContent{Type: ai.ContentTypeText, Text: "tool original"}},
+		Details: &toolDetails,
+	}
+	b := newAgent(t, Config{LLM: llm, Provider: "p", Model: "m", Messages: []ai.Message{toolResult}})
+	toolResult.Content[0].(*ai.TextContent).Text = "changed caller"
+	toolDetails["nested"].(map[string]any)["value"] = "changed caller"
+	snapshot := b.Messages()[0].(*ai.ToolResultMessage[map[string]any])
+	if got := snapshot.Content[0].(*ai.TextContent).Text; got != "tool original" {
+		t.Fatalf("tool-result history text = %q", got)
+	}
+	if got := (*snapshot.Details)["nested"].(map[string]any)["value"]; got != "details original" {
+		t.Fatalf("tool-result history details = %#v", got)
+	}
+	snapshot.Content[0].(*ai.TextContent).Text = "changed snapshot"
+	(*snapshot.Details)["nested"].(map[string]any)["value"] = "changed snapshot"
+	history := b.Messages()[0].(*ai.ToolResultMessage[map[string]any])
+	if got := history.Content[0].(*ai.TextContent).Text; got != "tool original" {
+		t.Fatalf("Messages result rewrote tool-result history: %q", got)
+	}
+	if got := (*history.Details)["nested"].(map[string]any)["value"]; got != "details original" {
+		t.Fatalf("Messages result rewrote tool-result details: %#v", got)
+	}
+
+	steering := UserText("steering original")
+	followUp := UserText("follow-up original")
+	if err := b.Steer(steering); err != nil {
+		t.Fatalf("Steer: %v", err)
+	}
+	if err := b.FollowUp(followUp); err != nil {
+		t.Fatalf("FollowUp: %v", err)
+	}
+	steering.Content[0].(*ai.TextContent).Text = "changed caller"
+	followUp.Content[0].(*ai.TextContent).Text = "changed caller"
+	if got := b.steering[0].(*ai.UserMessage).Content[0].(*ai.TextContent).Text; got != "steering original" {
+		t.Fatalf("queued steering text = %q", got)
+	}
+	if got := b.followUp[0].(*ai.UserMessage).Content[0].(*ai.TextContent).Text; got != "follow-up original" {
+		t.Fatalf("queued follow-up text = %q", got)
+	}
+}
+
+func TestTransformContextReceivesDetachedMessages(t *testing.T) {
+	initial := UserText("history original")
+	llm := &fakeLLM{script: []*ai.AssistantMessage{assistantText("done")}}
+	a := newAgent(t, Config{
+		LLM: llm, Provider: "p", Model: "m", Messages: []ai.Message{initial},
+		TransformContext: func(_ context.Context, messages []ai.Message) ([]ai.Message, error) {
+			messages[0].(*ai.UserMessage).Content[0].(*ai.TextContent).Text = "transformed"
+			return messages, nil
+		},
+	})
+	stream, err := a.Continue(context.Background())
+	if err != nil {
+		t.Fatalf("Continue: %v", err)
+	}
+	_, result, err := drainRun(t, stream)
+	if err != nil || result.Err != nil {
+		t.Fatalf("run errors = %v / %v", err, result.Err)
+	}
+	if got := llm.promptAt(0).Messages[0].(*ai.UserMessage).Content[0].(*ai.TextContent).Text; got != "transformed" {
+		t.Fatalf("transformed prompt text = %q", got)
+	}
+	if got := a.Messages()[0].(*ai.UserMessage).Content[0].(*ai.TextContent).Text; got != "history original" {
+		t.Fatalf("transform rewrote history: %q", got)
+	}
+}
+
+func TestAgentSnapshotsOptionsAndTypedToolDefinitions(t *testing.T) {
+	required := []string{"value"}
+	property := map[string]any{"type": "string"}
+	tool := NewTool(ToolDefinition{ToolDefinition: ai.ToolDefinition{
+		Name: "submit", Parameters: map[string]any{
+			"type":       "object",
+			"properties": map[string]any{"value": property},
+			"required":   required,
+		},
+	}}, func(context.Context, string, struct{}, func(ToolUpdate)) (*ToolOutput, error) {
+		return nil, nil
+	})
+	property["type"] = "number"
+	required[0] = "changed"
+	returned := tool.Definition()
+	returned.Parameters["properties"].(map[string]any)["value"].(map[string]any)["type"] = "boolean"
+	if got := tool.Definition().Parameters["properties"].(map[string]any)["value"].(map[string]any)["type"]; got != "string" {
+		t.Fatalf("tool definition retained caller/return aliases: %#v", got)
+	}
+
+	privateSchema := &privateSchemaMarshaler{values: map[string]any{"type": "string"}}
+	customTool := NewTool(ToolDefinition{ToolDefinition: ai.ToolDefinition{
+		Name: "custom", Parameters: map[string]any{"property": privateSchema},
+	}}, func(context.Context, string, struct{}, func(ToolUpdate)) (*ToolOutput, error) {
+		return nil, nil
+	})
+	privateSchema.values["type"] = "number"
+	if got := customTool.Definition().Parameters["property"].(map[string]any)["type"]; got != "string" {
+		t.Fatalf("tool definition retained custom marshaler private state: %#v", got)
+	}
+
+	temperature := 0.25
+	stops := []string{"original stop"}
+	extraNested := map[string]any{"value": "original extra"}
+	options := ai.StreamOptions{
+		Temperature: &temperature, StopSequences: stops,
+		Extra: map[string]any{"nested": extraNested},
+	}
+	llm := &fakeLLM{script: []*ai.AssistantMessage{assistantText("one"), assistantText("two")}}
+	a := newAgent(t, Config{LLM: llm, Provider: "p", Model: "m", Tools: []Tool{tool}})
+	if err := a.SetOptionsChecked(options); err != nil {
+		t.Fatalf("SetOptions: %v", err)
+	}
+	temperature = 1
+	stops[0] = "changed"
+	extraNested["value"] = "changed"
+
+	stream, _ := a.PromptText(context.Background(), "first")
+	_, result, _ := drainRun(t, stream)
+	if result.Err != nil {
+		t.Fatalf("first run: %v", result.Err)
+	}
+	first := llm.optionsAt(0)
+	if *first.Temperature != 0.25 || first.StopSequences[0] != "original stop" ||
+		first.Extra["nested"].(map[string]any)["value"] != "original extra" {
+		t.Fatalf("first options snapshot = %#v", first)
+	}
+	first.Extra["nested"].(map[string]any)["value"] = "changed adapter"
+	llm.promptAt(0).Tools[0].Parameters["type"] = "changed adapter"
+
+	stream, _ = a.PromptText(context.Background(), "second")
+	_, result, _ = drainRun(t, stream)
+	if result.Err != nil {
+		t.Fatalf("second run: %v", result.Err)
+	}
+	if got := llm.optionsAt(1).Extra["nested"].(map[string]any)["value"]; got != "original extra" {
+		t.Fatalf("adapter rewrote stored options: %#v", got)
+	}
+	if got := llm.promptAt(1).Tools[0].Parameters["type"]; got != "object" {
+		t.Fatalf("adapter rewrote stored tool definition: %#v", got)
+	}
+}
+
+func TestSetOptionsPreservesSignatureAndSurfacesSnapshotErrorOnRun(t *testing.T) {
+	llm := &fakeLLM{script: []*ai.AssistantMessage{assistantText("done")}}
+	a := newAgent(t, Config{LLM: llm, Provider: "p", Model: "m"})
+
+	// Intentionally use SetOptions as a value-less statement: this is the
+	// original public API shape retained for existing callers.
+	a.SetOptions(ai.StreamOptions{Extra: map[string]any{"bad": func() {}}})
+	stream, err := a.PromptText(context.Background(), "first")
+	if err != nil {
+		t.Fatalf("PromptText: %v", err)
+	}
+	_, result, err := drainRun(t, stream)
+	if err != nil || result.Err == nil || !strings.Contains(result.Err.Error(), "SetOptions") {
+		t.Fatalf("run errors = %v / %v", err, result.Err)
+	}
+	if llm.callCount() != 0 {
+		t.Fatalf("LLM calls = %d, want 0 for invalid snapshotted options", llm.callCount())
+	}
+
+	a.SetOptions(ai.StreamOptions{})
+	stream, err = a.Continue(context.Background())
+	if err != nil {
+		t.Fatalf("Continue: %v", err)
+	}
+	_, result, err = drainRun(t, stream)
+	if err != nil || result.Err != nil {
+		t.Fatalf("recovered run errors = %v / %v", err, result.Err)
 	}
 }

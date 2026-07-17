@@ -12,7 +12,7 @@ type Client struct {
 
 func NewClient(opts ...RequestOption) Client {
 	return Client{
-		Options:    opts,
+		Options:    append([]RequestOption(nil), opts...),
 		Chat:       NewChatService(opts...),
 		Embeddings: NewEmbeddingService(opts...),
 	}

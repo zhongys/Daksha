@@ -1,7 +1,6 @@
 package openaicompletions
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -34,20 +33,45 @@ func NewStreamer(opts ...openai.RequestOption) *Streamer {
 	}
 }
 
-// Stream never fails synchronously: request and transport errors are
-// delivered as an ErrorEvent plus a final message with StopReason
-// error/aborted, per the ai.Streamer contract.
+// Stream never fails synchronously: while ctx remains live, request and
+// transport errors are delivered as a terminal ErrorEvent plus a final message
+// with StopReasonError. Canceling ctx is a stream-mechanics failure instead:
+// Events closes and Result returns ctx.Err without a terminal event or result.
 func (s *Streamer) Stream(ctx context.Context, provider ai.Provider, model ai.Model, prompt ai.Prompt, opts ai.StreamOptions,
 ) *ai.EventStream[ai.AssistantMessageEvent, *ai.AssistantMessage] {
 	stream, producer := ai.NewEventStream[ai.AssistantMessageEvent, *ai.AssistantMessage](ctx, 64)
-	outputFormat, outputFormatErr := snapshotOutputFormat(opts.OutputFormat)
-	opts.OutputFormat = outputFormat
-	go s.run(ctx, producer, provider, model, prompt, opts, outputFormatErr)
+
+	// Everything below can observe caller-owned maps, slices, pointers or
+	// custom JSON marshalers. Finish it before returning so the request
+	// goroutine receives immutable wire bytes rather than mutable Go values.
+	var setupErr error
+	prompt, setupErr = ai.SnapshotPrompt(prompt)
+	if setupErr == nil {
+		opts, setupErr = ai.SnapshotStreamOptions(opts)
+	}
+	var requestBody json.RawMessage
+	if setupErr == nil {
+		var params openai.ChatCompletionNewParams
+		params, setupErr = buildParams(provider, model, prompt, opts)
+		if setupErr == nil {
+			requestBody, setupErr = json.Marshal(params)
+			if setupErr != nil {
+				setupErr = fmt.Errorf("openai: snapshot request body: %w", setupErr)
+			}
+		}
+	}
+	if setupErr != nil {
+		// Some encoding/json errors retain reflect.Values into the rejected
+		// input. The asynchronous error path needs only an immutable message.
+		setupErr = errors.New(setupErr.Error())
+	}
+
+	go s.run(ctx, producer, provider, model, opts, requestBody, setupErr)
 	return stream
 }
 
 func (s *Streamer) run(ctx context.Context, producer *ai.Producer[ai.AssistantMessageEvent, *ai.AssistantMessage],
-	provider ai.Provider, model ai.Model, prompt ai.Prompt, opts ai.StreamOptions, outputFormatErr error) {
+	provider ai.Provider, model ai.Model, opts ai.StreamOptions, requestBody json.RawMessage, setupErr error) {
 
 	msg := &ai.AssistantMessage{
 		Role:       ai.RoleAssistant,
@@ -60,14 +84,8 @@ func (s *Streamer) run(ctx context.Context, producer *ai.Producer[ai.AssistantMe
 	if msg.Provider == "" {
 		msg.Provider = provider.Name
 	}
-	if outputFormatErr != nil {
-		fail(ctx, producer, msg, outputFormatErr)
-		return
-	}
-
-	params, err := buildParams(provider, model, prompt, opts)
-	if err != nil {
-		fail(ctx, producer, msg, err)
+	if setupErr != nil {
+		fail(ctx, producer, msg, setupErr)
 		return
 	}
 
@@ -79,7 +97,7 @@ func (s *Streamer) run(ctx context.Context, producer *ai.Producer[ai.AssistantMe
 		reqOpts = append(reqOpts, openai.WithAPIKey(provider.APIKey))
 	}
 
-	sse := s.completions.NewStreaming(ctx, params, reqOpts...)
+	sse := s.completions.NewStreamingJSON(ctx, requestBody, reqOpts...)
 	defer sse.Close()
 	if err := sse.Err(); err != nil {
 		fail(ctx, producer, msg, err)
@@ -92,25 +110,67 @@ func (s *Streamer) run(ctx context.Context, producer *ai.Producer[ai.AssistantMe
 
 	acc := &accumulator{msg: msg, producer: producer, outputFormat: opts.OutputFormat}
 	hasFinishReason := false
+	finishReason := ""
+	responseModel := ""
+	choiceIndex := int64(0)
+	hasChoiceIndex := false
 
 	for sse.Next() {
 		chunk := sse.Current()
 
-		// Every chunk of one completion carries the same id.
-		if msg.ResponseId == "" {
+		if chunk.Object != "" && chunk.Object != "chat.completion.chunk" {
+			fail(ctx, producer, msg, fmt.Errorf(
+				"openai: invalid streaming response object %q", chunk.Object,
+			))
+			return
+		}
+		// Non-empty completion identity fields must remain stable across usage
+		// and content chunks. Compatible providers may omit them on some chunks.
+		if msg.ResponseId != "" && chunk.ID != "" && chunk.ID != msg.ResponseId {
+			fail(ctx, producer, msg, fmt.Errorf(
+				"openai: streaming response id changed from %q to %q", msg.ResponseId, chunk.ID,
+			))
+			return
+		}
+		if msg.ResponseId == "" && chunk.ID != "" {
 			msg.ResponseId = chunk.ID
 		}
-		if msg.ResponseModel == "" && chunk.Model != "" && chunk.Model != model.ID {
-			msg.ResponseModel = chunk.Model
+		if responseModel != "" && chunk.Model != "" && chunk.Model != responseModel {
+			fail(ctx, producer, msg, fmt.Errorf(
+				"openai: streaming response model changed from %q to %q", responseModel, chunk.Model,
+			))
+			return
+		}
+		if responseModel == "" && chunk.Model != "" {
+			responseModel = chunk.Model
+			if chunk.Model != model.ID {
+				msg.ResponseModel = chunk.Model
+			}
 		}
 		if usageIsSet(chunk.Usage) {
 			msg.Usage = convertUsage(chunk.Usage, model)
 		}
 
+		if len(chunk.Choices) > 1 {
+			fail(ctx, producer, msg, fmt.Errorf(
+				"openai: streaming response returned %d choices; exactly one is supported", len(chunk.Choices),
+			))
+			return
+		}
 		if len(chunk.Choices) == 0 {
 			continue
 		}
 		choice := chunk.Choices[0]
+		if hasChoiceIndex && choice.Index != choiceIndex {
+			fail(ctx, producer, msg, fmt.Errorf(
+				"openai: streaming choice index changed from %d to %d", choiceIndex, choice.Index,
+			))
+			return
+		}
+		if !hasChoiceIndex {
+			choiceIndex = choice.Index
+			hasChoiceIndex = true
+		}
 
 		// Some providers (e.g. Moonshot) report usage on the choice.
 		if !usageIsSet(chunk.Usage) && usageIsSet(choice.Usage) {
@@ -118,6 +178,14 @@ func (s *Streamer) run(ctx context.Context, producer *ai.Producer[ai.AssistantMe
 		}
 
 		if choice.FinishReason != "" {
+			if finishReason != "" && choice.FinishReason != finishReason {
+				fail(ctx, producer, msg, fmt.Errorf(
+					"openai: conflicting finish_reason values %q and %q",
+					finishReason, choice.FinishReason,
+				))
+				return
+			}
+			finishReason = choice.FinishReason
 			reason, errMsg := mapStopReason(choice.FinishReason)
 			msg.StopReason = reason
 			if errMsg != "" {
@@ -135,28 +203,28 @@ func (s *Streamer) run(ctx context.Context, producer *ai.Producer[ai.AssistantMe
 		fail(ctx, producer, msg, err)
 		return
 	}
-	if hasFinishReason {
-		if err := validateToolCallState(msg.StopReason, acc.toolOrder); err != nil {
-			fail(ctx, producer, msg, err)
-			return
-		}
-	}
-	if err := acc.finishAll(ctx, hasFinishReason); err != nil {
-		if ctx.Err() == nil {
-			fail(ctx, producer, msg, err)
-		}
+	if ctx.Err() != nil {
 		return
 	}
-	if ctx.Err() != nil {
-		fail(ctx, producer, msg, ctx.Err())
+	if !hasFinishReason {
+		fail(ctx, producer, msg, errors.New("stream ended without finish_reason"))
 		return
 	}
 	if msg.StopReason == ai.StopReasonError {
 		fail(ctx, producer, msg, errors.New(msg.ErrorMessage))
 		return
 	}
-	if !hasFinishReason {
-		fail(ctx, producer, msg, errors.New("stream ended without finish_reason"))
+	if err := validateToolCallState(msg.StopReason, acc.toolOrder); err != nil {
+		fail(ctx, producer, msg, err)
+		return
+	}
+	if err := acc.finishAll(ctx); err != nil {
+		if ctx.Err() == nil {
+			fail(ctx, producer, msg, err)
+		}
+		return
+	}
+	if ctx.Err() != nil {
 		return
 	}
 
@@ -170,15 +238,63 @@ func fail(ctx context.Context, producer *ai.Producer[ai.AssistantMessageEvent, *
 	msg *ai.AssistantMessage, err error) {
 
 	if ctx.Err() != nil {
-		msg.StopReason = ai.StopReasonAborted
-	} else {
-		msg.StopReason = ai.StopReasonError
+		// The EventStream itself owns cancellation. It closes Events and makes
+		// Result return ctx.Err; publishing with the canceled context could only
+		// race that shutdown and produce a nondeterministic terminal event.
+		return
 	}
-	if msg.ErrorMessage == "" || msg.StopReason == ai.StopReasonAborted {
-		msg.ErrorMessage = err.Error()
-	}
+	msg.StopReason = ai.StopReasonError
+	msg.ErrorMessage = err.Error()
+	recordErrorDiagnostics(msg, err)
 	_ = producer.Publish(ctx, ai.ErrorEvent{Reason: msg.StopReason, Error: snapshotAssistantMessage(msg)})
 	_ = producer.Complete(ctx, msg)
+}
+
+func recordErrorDiagnostics(msg *ai.AssistantMessage, err error) {
+	diagnostics := &msg.Diagnostics
+	diagnostics.Type = "error"
+	diagnostics.Timestamp = time.Now().UnixMilli()
+	diagnostics.Error = ai.DiagnosticErrorInfo{
+		Name:    "Error",
+		Message: err.Error(),
+	}
+
+	var streamErr *openai.StreamError
+	if errors.As(err, &streamErr) {
+		diagnostics.Error.Name = "StreamError"
+		if diagnostics.Details == nil {
+			diagnostics.Details = map[string]any{}
+		}
+		diagnostics.Details["eventType"] = streamErr.Event.Type
+		diagnostics.Details["eventData"] = string(streamErr.Event.Data)
+	}
+
+	var apiErr *openai.APIError
+	if !errors.As(err, &apiErr) {
+		return
+	}
+	if streamErr == nil {
+		diagnostics.Error.Name = "APIError"
+	}
+	if apiErr.Message != "" {
+		diagnostics.Error.Message = apiErr.Message
+	}
+	diagnostics.Error.Code = apiErr.Code
+	if diagnostics.Details == nil {
+		diagnostics.Details = map[string]any{}
+	}
+	if apiErr.StatusCode != 0 {
+		diagnostics.Details["statusCode"] = apiErr.StatusCode
+	}
+	if apiErr.Type != "" {
+		diagnostics.Details["apiErrorType"] = apiErr.Type
+	}
+	if apiErr.Param != "" {
+		diagnostics.Details["param"] = apiErr.Param
+	}
+	if apiErr.Body != "" {
+		diagnostics.Details["body"] = apiErr.Body
+	}
 }
 
 // accumulator reassembles content blocks from streamed deltas and emits the
@@ -252,33 +368,6 @@ func cloneJSONValue(value any) any {
 	default:
 		return value
 	}
-}
-
-// snapshotOutputFormat validates and freezes the schema before Stream returns;
-// the request goroutine must not retain caller-owned maps that can be mutated
-// while it validates or marshals the request.
-func snapshotOutputFormat(format ai.OutputFormat) (ai.OutputFormat, error) {
-	if err := format.Validate(); err != nil {
-		return format, err
-	}
-	if format.JSONSchema == nil {
-		return format, nil
-	}
-
-	schema := *format.JSONSchema
-	encoded, err := json.Marshal(schema.Schema)
-	if err != nil {
-		return format, fmt.Errorf("openai: snapshot output schema: %w", err)
-	}
-	decoder := json.NewDecoder(bytes.NewReader(encoded))
-	decoder.UseNumber()
-	var clonedSchema map[string]any
-	if err := decoder.Decode(&clonedSchema); err != nil {
-		return format, fmt.Errorf("openai: snapshot output schema: %w", err)
-	}
-	schema.Schema = clonedSchema
-	format.JSONSchema = &schema
-	return format, nil
 }
 
 func (a *accumulator) applyDelta(ctx context.Context, delta openai.ChatCompletionChunkChoiceDelta) error {
@@ -444,10 +533,10 @@ func (a *accumulator) startToolCall(ctx context.Context,
 }
 
 // finishAll validates completed tool arguments and structured final JSON before
-// closing open blocks in content order. Partial JSON is for UI updates only: no
-// terminal success event becomes observable until the relevant final buffers
-// satisfy their contracts.
-func (a *accumulator) finishAll(ctx context.Context, validateFinalOutput bool) error {
+// closing any open block. Partial JSON is for UI updates only: no terminal
+// success event becomes observable until every final buffer satisfies its
+// contract.
+func (a *accumulator) finishAll(ctx context.Context) error {
 	for _, state := range a.toolOrder {
 		arguments, err := decodeJSONObject(state.partialArgs.String())
 		if err != nil {
@@ -458,7 +547,7 @@ func (a *accumulator) finishAll(ctx context.Context, validateFinalOutput bool) e
 		}
 		state.block.Arguments = arguments
 	}
-	jsonFinalized, err := a.finalizeJSON(validateFinalOutput)
+	jsonFinalized, err := a.finalizeJSON()
 	if err != nil {
 		return err
 	}
@@ -504,17 +593,11 @@ func (a *accumulator) finishAll(ctx context.Context, validateFinalOutput bool) e
 // contain no JSON block even when the eventual answer is structured. If a
 // structured tool-use turn does emit content, it must still be valid JSON so
 // its JSONStart event can close with JSONEnd rather than dangling at Done.
-func (a *accumulator) finalizeJSON(validateFinalOutput bool) (bool, error) {
+func (a *accumulator) finalizeJSON() (bool, error) {
 	if !a.outputFormat.IsJSON() {
 		return false, nil
 	}
 	raw := a.jsonBuffer.String()
-	if !validateFinalOutput || a.msg.StopReason == ai.StopReasonError || a.msg.StopReason == ai.StopReasonAborted {
-		if a.jsonContent != nil {
-			a.rememberRawJSON(raw)
-		}
-		return false, nil
-	}
 	if a.msg.StopReason == ai.StopReasonToolUse && a.jsonContent == nil {
 		return false, nil
 	}

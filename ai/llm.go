@@ -178,11 +178,16 @@ type StreamOptions struct {
 // in-flight requests finish on the snapshot they started with.
 //
 // Contract (mirrors pi-ai's StreamFunction): the call itself never fails.
-// Request, transport and parse failures are encoded in the returned stream —
-// an ErrorEvent followed by completion with a final AssistantMessage whose
-// StopReason is StopReasonError or StopReasonAborted and whose ErrorMessage
-// is set. Consumers must drain Events() until closed; Result() then returns
-// the final message.
+// While ctx remains live, request, transport and parse failures are encoded in
+// the returned stream — a terminal ErrorEvent followed by completion with a
+// final AssistantMessage whose StopReason is StopReasonError and whose
+// ErrorMessage is set. ErrorEvent implicitly aborts any open content blocks.
+// Consumers must drain Events() until closed; Result() then returns the final
+// message. Canceling ctx is instead a stream-mechanics failure: Events closes
+// and Result returns ctx.Err without requiring a terminal event or result.
+// Implementations must finish reading or snapshotting every caller-owned
+// mutable input before Stream returns. Callers may safely reuse or mutate the
+// original Prompt and StreamOptions after that boundary.
 //
 // Adapters must accept this neutral StreamOptions as-is; inventing
 // adapter-specific option types is forbidden (it is why pi needed a separate

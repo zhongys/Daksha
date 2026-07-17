@@ -157,6 +157,12 @@ func (c *Client) Stream(ctx context.Context, providerName, modelID string, promp
 ) *EventStream[AssistantMessageEvent, *AssistantMessage] {
 	provider, model, adapter, err := c.resolve(providerName, modelID)
 	if err == nil {
+		prompt, err = SnapshotPrompt(prompt)
+	}
+	if err == nil {
+		opts, err = SnapshotStreamOptions(opts)
+	}
+	if err == nil {
 		err = checkCapabilities(model, prompt)
 	}
 	if err != nil {

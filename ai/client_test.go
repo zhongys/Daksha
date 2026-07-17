@@ -34,12 +34,18 @@ func (failingExtra) MarshalJSON() ([]byte, error) {
 type fakeStreamer struct {
 	gotProvider Provider
 	gotModel    Model
+	gotPrompt   Prompt
+	gotOptions  StreamOptions
+	calls       int
 }
 
 func (f *fakeStreamer) Stream(ctx context.Context, provider Provider, model Model, prompt Prompt, opts StreamOptions,
 ) *EventStream[AssistantMessageEvent, *AssistantMessage] {
 	f.gotProvider = provider
 	f.gotModel = model
+	f.gotPrompt = prompt
+	f.gotOptions = opts
+	f.calls++
 	stream, producer := NewEventStream[AssistantMessageEvent, *AssistantMessage](ctx, 2)
 	go func() {
 		msg := &AssistantMessage{Role: RoleAssistant, StopReason: StopReasonStop}
@@ -543,6 +549,67 @@ func TestClientDispatchSnapshot(t *testing.T) {
 	}
 	if fake.gotModel.ID != "m1" {
 		t.Fatalf("adapter got model %+v", fake.gotModel)
+	}
+}
+
+func TestClientStreamSnapshotsPromptAndOptionsBeforeDispatch(t *testing.T) {
+	fake := &fakeStreamer{}
+	c := newTestClient(fake)
+
+	text := &TextContent{Type: ContentTypeText, Text: "original prompt"}
+	property := map[string]any{"type": "string"}
+	parameters := map[string]any{
+		"type":       "object",
+		"properties": map[string]any{"value": property},
+	}
+	temperature := 0.25
+	stops := []string{"original stop"}
+	extra := map[string]any{"nested": map[string]any{"value": "original extra"}}
+	prompt := Prompt{
+		Messages: []Message{&UserMessage{Role: RoleUser, Content: []UserContent{text}}},
+		Tools:    []ToolDefinition{{Name: "lookup", Parameters: parameters}},
+	}
+	options := StreamOptions{Temperature: &temperature, StopSequences: stops, Extra: extra}
+
+	stream := c.Stream(context.Background(), "acme", "m1", prompt, options)
+	text.Text = "changed original"
+	property["type"] = "number"
+	temperature = 1
+	stops[0] = "changed"
+	extra["nested"].(map[string]any)["value"] = "changed"
+	drain(t, stream)
+
+	gotText := fake.gotPrompt.Messages[0].(*UserMessage).Content[0].(*TextContent).Text
+	if gotText != "original prompt" {
+		t.Fatalf("adapter prompt text = %q", gotText)
+	}
+	gotProperty := fake.gotPrompt.Tools[0].Parameters["properties"].(map[string]any)["value"].(map[string]any)
+	if gotProperty["type"] != "string" {
+		t.Fatalf("adapter tool schema = %#v", fake.gotPrompt.Tools[0].Parameters)
+	}
+	if *fake.gotOptions.Temperature != 0.25 {
+		t.Fatalf("adapter temperature = %v", *fake.gotOptions.Temperature)
+	}
+	if fake.gotOptions.StopSequences[0] != "original stop" {
+		t.Fatalf("adapter stops = %#v", fake.gotOptions.StopSequences)
+	}
+	if got := fake.gotOptions.Extra["nested"].(map[string]any)["value"]; got != "original extra" {
+		t.Fatalf("adapter extra = %#v", fake.gotOptions.Extra)
+	}
+}
+
+func TestClientStreamSnapshotFailureUsesFailedStream(t *testing.T) {
+	fake := &fakeStreamer{}
+	c := newTestClient(fake)
+	stream := c.Stream(context.Background(), "acme", "m1", Prompt{}, StreamOptions{
+		Extra: map[string]any{"invalid": func() {}},
+	})
+	message := drain(t, stream)
+	if message.StopReason != StopReasonError || !strings.Contains(message.ErrorMessage, "snapshot stream options extra") {
+		t.Fatalf("snapshot failure = stop %q, error %q", message.StopReason, message.ErrorMessage)
+	}
+	if fake.calls != 0 {
+		t.Fatalf("adapter calls = %d, want 0", fake.calls)
 	}
 }
 

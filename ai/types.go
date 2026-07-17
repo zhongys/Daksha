@@ -210,9 +210,14 @@ type ToolResultMessage[T any] struct {
 	ToolCallId string              `json:"toolCallId"`
 	ToolName   string              `json:"toolName"`
 	Content    []ToolResultContent `json:"content"`
-	Details    *T                  `json:"details,omitempty"`
-	IsError    bool                `json:"isError"`
-	Timestamp  int64               `json:"timestamp"`
+	// Details is application metadata and is not sent to the model. Daksha
+	// structurally snapshots ordinary pointer/map/slice/exported-struct data at
+	// ownership boundaries. Opaque mutable state hidden behind unexported
+	// fields, functions or channels remains caller-owned and must be immutable
+	// after handoff.
+	Details   *T    `json:"details,omitempty"`
+	IsError   bool  `json:"isError"`
+	Timestamp int64 `json:"timestamp"`
 }
 
 // ToolResult gives protocol adapters generic-free access to any
@@ -351,6 +356,8 @@ type ToolCallEndEvent struct {
 
 func (ToolCallEndEvent) EventType() AssistantMessageEventType { return AssistantEventToolCallEnd }
 
+// DoneEvent is the sole terminal event for a successful turn. All content
+// blocks emitted by the turn have ended before DoneEvent is published.
 type DoneEvent struct {
 	Reason  StopReason
 	Message AssistantMessage
@@ -358,6 +365,10 @@ type DoneEvent struct {
 
 func (DoneEvent) EventType() AssistantMessageEventType { return AssistantEventDone }
 
+// ErrorEvent is the sole terminal event for a failed turn. It implicitly
+// aborts every content block that has emitted Start without a matching End;
+// End events certify valid final content and therefore are not emitted for
+// those blocks on an error path.
 type ErrorEvent struct {
 	Reason StopReason
 	Error  AssistantMessage

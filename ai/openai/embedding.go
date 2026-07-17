@@ -14,7 +14,7 @@ type EmbeddingService struct {
 
 func NewEmbeddingService(opts ...RequestOption) (r EmbeddingService) {
 	r = EmbeddingService{}
-	r.Options = opts
+	r.Options = slices.Clone(opts)
 	return
 }
 
@@ -23,7 +23,68 @@ func (r *EmbeddingService) New(ctx context.Context, body EmbeddingNewParams, opt
 	opts = slices.Concat(preClientOpts, r.Options, opts)
 	path := "embeddings"
 	err = ExecuteNewRequest(ctx, http.MethodPost, path, body, &res, opts...)
-	return res, err
+	if err != nil {
+		return nil, err
+	}
+	if err := validateEmbeddingResponse(res, body); err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
+func validateEmbeddingResponse(res *CreateEmbeddingResponse, request EmbeddingNewParams) error {
+	if res == nil {
+		return fmt.Errorf("openai: invalid embedding response: top-level value is null")
+	}
+	if res.Object != "" && res.Object != "list" {
+		return fmt.Errorf("openai: invalid embedding response object %q", res.Object)
+	}
+	if len(res.Data) == 0 {
+		return fmt.Errorf("openai: invalid embedding response: data is empty")
+	}
+
+	_, inputOverridden := request.ExtraFields["input"]
+	if !inputOverridden && len(res.Data) != len(request.Input) {
+		return fmt.Errorf(
+			"openai: invalid embedding response: got %d embeddings for %d inputs",
+			len(res.Data), len(request.Input),
+		)
+	}
+	_, dimensionsOverridden := request.ExtraFields["dimensions"]
+
+	seenIndexes := make(map[int64]struct{}, len(res.Data))
+	vectorLength := -1
+	for i, item := range res.Data {
+		if item.Object != "" && item.Object != "embedding" {
+			return fmt.Errorf("openai: invalid embedding item %d object %q", i, item.Object)
+		}
+		if item.Index < 0 || item.Index >= int64(len(res.Data)) {
+			return fmt.Errorf("openai: invalid embedding item %d: index %d out of range", i, item.Index)
+		}
+		if _, exists := seenIndexes[item.Index]; exists {
+			return fmt.Errorf("openai: invalid embedding response: duplicate index %d", item.Index)
+		}
+		seenIndexes[item.Index] = struct{}{}
+
+		if len(item.Embedding) == 0 {
+			return fmt.Errorf("openai: invalid embedding item %d: vector is empty", item.Index)
+		}
+		if vectorLength < 0 {
+			vectorLength = len(item.Embedding)
+		} else if len(item.Embedding) != vectorLength {
+			return fmt.Errorf(
+				"openai: invalid embedding item %d: vector length %d does not match %d",
+				item.Index, len(item.Embedding), vectorLength,
+			)
+		}
+		if request.Dimensions > 0 && !dimensionsOverridden && int64(len(item.Embedding)) != request.Dimensions {
+			return fmt.Errorf(
+				"openai: invalid embedding item %d: vector length %d does not match requested dimensions %d",
+				item.Index, len(item.Embedding), request.Dimensions,
+			)
+		}
+	}
+	return nil
 }
 
 type EmbeddingNewParams struct {

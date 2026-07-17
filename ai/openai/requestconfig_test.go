@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -15,6 +16,10 @@ import (
 type httpDoerFunc func(*http.Request) (*http.Response, error)
 
 func (f httpDoerFunc) Do(req *http.Request) (*http.Response, error) { return f(req) }
+
+type aliasingJSONMarshaler struct{ raw []byte }
+
+func (m aliasingJSONMarshaler) MarshalJSON() ([]byte, error) { return m.raw, nil }
 
 type trackingResponseBody struct {
 	reader io.Reader
@@ -518,4 +523,142 @@ func responseDoer(body io.ReadCloser) HTTPDoer {
 			Request:    req,
 		}, nil
 	})
+}
+
+func TestNewRequestConfigSnapshotsSerializedBytes(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		body func([]byte) any
+	}{
+		{name: "raw bytes", body: func(raw []byte) any { return raw }},
+		{name: "json marshaler", body: func(raw []byte) any { return aliasingJSONMarshaler{raw: raw} }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			raw := []byte(`{"value":"before"}`)
+			cfg, err := NewRequestConfig(
+				context.Background(), http.MethodPost, "/snapshot", tt.body(raw), nil,
+			)
+			if err != nil {
+				t.Fatalf("NewRequestConfig: %v", err)
+			}
+			copy(raw, []byte(`{"value":"after!"}`))
+
+			got, err := io.ReadAll(cfg.Body)
+			if err != nil {
+				t.Fatalf("read snapshotted body: %v", err)
+			}
+			if want := `{"value":"before"}`; string(got) != want {
+				t.Fatalf("request body = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestExecuteRequiresOneConcreteJSONDocument(t *testing.T) {
+	tests := []struct {
+		name        string
+		contentType string
+		body        string
+		wantErr     bool
+	}{
+		{name: "one document", contentType: "application/json", body: "{\"ok\":true}\n", wantErr: false},
+		{name: "structured suffix", contentType: "application/vnd.test+json; charset=utf-8", body: `{"ok":true}`, wantErr: false},
+		{name: "second document", contentType: "application/json", body: `{"ok":true} {"ok":false}`, wantErr: true},
+		{name: "trailing garbage", contentType: "application/json", body: `{"ok":true} trailing`, wantErr: true},
+		{name: "empty body", contentType: "application/json", body: "", wantErr: true},
+		{name: "whitespace body", contentType: "application/json", body: " \n\t", wantErr: true},
+		{name: "null body", contentType: "application/json", body: "null", wantErr: true},
+		{name: "json sequence is not one json document", contentType: "application/json-seq", body: `{"ok":true}`, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := &trackingResponseBody{reader: strings.NewReader(tt.body)}
+			var dst struct {
+				OK bool `json:"ok"`
+			}
+			err := ExecuteNewRequest(
+				context.Background(), http.MethodGet, "/json", nil, &dst,
+				WithDefaultBaseURL("https://example.test/"),
+				WithHTTPClient(httpDoerFunc(func(req *http.Request) (*http.Response, error) {
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     http.Header{"Content-Type": []string{tt.contentType}},
+						Body:       body,
+						Request:    req,
+					}, nil
+				})),
+			)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("ExecuteNewRequest error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if !body.closed {
+				t.Fatal("response body was not closed")
+			}
+			if !tt.wantErr && !dst.OK {
+				t.Fatal("decoded response was not populated")
+			}
+		})
+	}
+}
+
+func TestExecuteTurnsSuccessfulErrorEnvelopeIntoAPIError(t *testing.T) {
+	body := &trackingResponseBody{reader: strings.NewReader(
+		`{"error":{"message":"quota exhausted","type":"rate_limit","code":429}}`,
+	)}
+	var dst map[string]any
+	err := ExecuteNewRequest(
+		context.Background(), http.MethodGet, "/json", nil, &dst,
+		WithDefaultBaseURL("https://example.test/"),
+		WithHTTPClient(httpDoerFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       body,
+				Request:    req,
+			}, nil
+		})),
+	)
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("ExecuteNewRequest error = %T %v, want *APIError", err, err)
+	}
+	if apiErr.StatusCode != http.StatusOK || apiErr.Message != "quota exhausted" || apiErr.Code != "429" {
+		t.Fatalf("APIError = %+v", apiErr)
+	}
+	if !body.closed {
+		t.Fatal("response body was not closed")
+	}
+}
+
+func TestExecuteRejectsNilSuccessfulResponseParts(t *testing.T) {
+	tests := []struct {
+		name string
+		do   httpDoerFunc
+	}{
+		{
+			name: "nil response",
+			do: func(*http.Request) (*http.Response, error) {
+				return nil, nil
+			},
+		},
+		{
+			name: "nil body",
+			do: func(req *http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Request: req}, nil
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ExecuteNewRequest(
+				context.Background(), http.MethodGet, "/nil", nil, nil,
+				WithDefaultBaseURL("https://example.test/"), WithHTTPClient(tt.do),
+			)
+			if err == nil {
+				t.Fatal("ExecuteNewRequest succeeded")
+			}
+		})
+	}
 }

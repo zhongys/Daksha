@@ -75,6 +75,7 @@ type Agent struct {
 	systemPrompt  string
 	tools         []Tool
 	options       ai.StreamOptions
+	optionsErr    error
 	toolExecution ExecutionMode
 	maxTurns      int
 
@@ -102,13 +103,17 @@ func New(cfg Config) (*Agent, error) {
 	if cfg.Provider == "" || cfg.Model == "" {
 		return nil, errors.New("agent: Config.Provider and Config.Model are required")
 	}
+	options, err := ai.SnapshotStreamOptions(cfg.Options)
+	if err != nil {
+		return nil, fmt.Errorf("agent: Config.Options: %w", err)
+	}
 	return &Agent{
 		llm:                 cfg.LLM,
 		provider:            cfg.Provider,
 		model:               cfg.Model,
 		systemPrompt:        cfg.SystemPrompt,
 		tools:               append([]Tool(nil), cfg.Tools...),
-		options:             cfg.Options,
+		options:             options,
 		toolExecution:       cfg.ToolExecution,
 		maxTurns:            cfg.MaxTurns,
 		transformContext:    cfg.TransformContext,
@@ -157,6 +162,9 @@ func (a *Agent) beginRun(ctx context.Context, initial []ai.Message, continuing b
 	if ctx == nil {
 		return nil, errors.New("agent: nil context")
 	}
+	// Prompt returns an asynchronous run. Freeze caller-owned messages before
+	// returning so the run never observes later caller mutations.
+	initial = cloneMessages(initial)
 
 	// Construct the child context outside a.mu: a custom parent may run code
 	// from AfterFunc while WithCancel wires cancellation propagation.
@@ -221,6 +229,7 @@ func (a *Agent) Steer(msg *ai.UserMessage) error {
 	if msg == nil {
 		return errors.New("agent: nil message")
 	}
+	msg = cloneMessage(msg).(*ai.UserMessage)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.steering = append(a.steering, msg)
@@ -233,6 +242,7 @@ func (a *Agent) FollowUp(msg *ai.UserMessage) error {
 	if msg == nil {
 		return errors.New("agent: nil message")
 	}
+	msg = cloneMessage(msg).(*ai.UserMessage)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.followUp = append(a.followUp, msg)
@@ -330,8 +340,33 @@ func (a *Agent) SetTools(tools []Tool) {
 	a.tools = append([]Tool(nil), tools...)
 }
 
+// SetOptions preserves the original setter API. Invalid reference-backed
+// values are remembered as a configuration error and make the next run fail
+// before dispatch instead of retaining caller-owned input.
 func (a *Agent) SetOptions(opts ai.StreamOptions) {
+	snapshot, err := ai.SnapshotStreamOptions(opts)
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.options = opts
+	if err != nil {
+		// Store only immutable text: encoding/json errors may retain a
+		// reflect.Value pointing into the rejected caller-owned tree.
+		a.optionsErr = fmt.Errorf("agent: SetOptions: %s", err)
+		return
+	}
+	a.options = snapshot
+	a.optionsErr = nil
+}
+
+// SetOptionsChecked snapshots per-turn options and reports invalid JSON-backed
+// values immediately. On error the existing configuration is unchanged.
+func (a *Agent) SetOptionsChecked(opts ai.StreamOptions) error {
+	snapshot, err := ai.SnapshotStreamOptions(opts)
+	if err != nil {
+		return fmt.Errorf("agent: SetOptionsChecked: %w", err)
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.options = snapshot
+	a.optionsErr = nil
+	return nil
 }

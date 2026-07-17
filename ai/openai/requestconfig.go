@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -45,19 +46,25 @@ func NewRequestConfig(ctx context.Context, method string, u string, body any, ds
 	contentType := "application/json"
 	hasSerializationFunc := false
 
-	if body, ok := body.(json.Marshaler); ok {
+	switch body := body.(type) {
+	case json.Marshaler:
 		content, err := body.MarshalJSON()
 		if err != nil {
 			return nil, err
 		}
-		reader = bytes.NewBuffer(content)
+		// A Marshaler is allowed to return storage it still owns. Freeze the
+		// serialized request now so later caller mutations cannot change what is
+		// sent when Execute eventually attaches the body to the request.
+		reader = bytes.NewBuffer(bytes.Clone(content))
 		hasSerializationFunc = true
-	}
-	if body, ok := body.([]byte); ok {
-		reader = bytes.NewBuffer(body)
+	case []byte:
+		// Treat raw request bytes as an input snapshot, not as shared mutable
+		// storage retained until Execute.
+		reader = bytes.NewBuffer(bytes.Clone(body))
 		hasSerializationFunc = true
-	}
-	if body, ok := body.(io.Reader); ok {
+	case io.Reader:
+		// Readers are inherently stateful and cannot be copied generically. The
+		// caller retains ownership until Execute has consumed the request.
 		reader = body
 		hasSerializationFunc = true
 	}
@@ -240,6 +247,12 @@ func (cfg *RequestConfig) Execute() (err error) {
 		closeUnownedResponse()
 		return err
 	}
+	if res == nil {
+		return errors.New("requestconfig: http client returned a nil response without an error")
+	}
+	if res.Body == nil {
+		return errors.New("requestconfig: http client returned a response with a nil body")
+	}
 
 	if res.StatusCode < http.StatusOK || res.StatusCode >= http.StatusMultipleChoices {
 		contents, err := io.ReadAll(res.Body)
@@ -282,8 +295,9 @@ func (cfg *RequestConfig) Execute() (err error) {
 
 	// If we are not json, return plaintext
 	contentType := res.Header.Get("content-type")
-	mediaType, _, _ := mime.ParseMediaType(contentType)
-	isJSON := strings.Contains(mediaType, "application/json") || strings.HasSuffix(mediaType, "+json")
+	mediaType, _, mediaTypeErr := mime.ParseMediaType(contentType)
+	isJSON := mediaTypeErr == nil && (strings.EqualFold(mediaType, "application/json") ||
+		strings.HasSuffix(strings.ToLower(mediaType), "+json"))
 	if !isJSON {
 		switch dst := cfg.ResponseBodyInto.(type) {
 		case *string:
@@ -304,8 +318,21 @@ func (cfg *RequestConfig) Execute() (err error) {
 	case *[]byte:
 		*dst = contents
 	default:
-		err = json.NewDecoder(bytes.NewReader(contents)).Decode(cfg.ResponseBodyInto)
-		if err != nil {
+		trimmed := bytes.TrimSpace(contents)
+		if len(trimmed) == 0 {
+			return errors.New("error parsing response json: empty response body")
+		}
+		if bytes.Equal(trimmed, []byte("null")) {
+			return errors.New("error parsing response json: top-level value is null")
+		}
+		if apiErr := errorFromEventData(contents); apiErr != nil {
+			apiErr.StatusCode = res.StatusCode
+			return apiErr
+		}
+		// Unmarshal, unlike a single Decoder.Decode call, requires the complete
+		// body to contain exactly one JSON value and rejects a second value or
+		// any other trailing non-whitespace data.
+		if err = json.Unmarshal(contents, cfg.ResponseBodyInto); err != nil {
 			return fmt.Errorf("error parsing response json: %w", err)
 		}
 	}

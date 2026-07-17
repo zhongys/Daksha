@@ -1,7 +1,11 @@
 package openai
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
 	"strings"
 	"testing"
 )
@@ -368,5 +372,241 @@ func TestChatCompletionUnmarshalKeepsRaw(t *testing.T) {
 	}
 	if !strings.Contains(string(res.Raw), `"provider_meta":"p"`) {
 		t.Errorf("Raw = %s", res.Raw)
+	}
+}
+
+func TestChatCompletionServiceValidatesSuccessfulResponse(t *testing.T) {
+	tests := []struct {
+		name    string
+		body    string
+		wantErr bool
+	}{
+		{
+			name: "minimal compatible response",
+			body: `{"id":"r","choices":[{"index":0,"finish_reason":"stop","message":{"content":"ok"}}]}`,
+		},
+		{name: "null", body: `null`, wantErr: true},
+		{name: "empty object", body: `{}`, wantErr: true},
+		{name: "empty choices", body: `{"choices":[]}`, wantErr: true},
+		{name: "missing finish reason", body: `{"choices":[{"index":0,"message":{"content":"ok"}}]}`, wantErr: true},
+		{
+			name:    "duplicate choice index",
+			body:    `{"choices":[{"index":0,"finish_reason":"stop"},{"index":0,"finish_reason":"stop"}]}`,
+			wantErr: true,
+		},
+		{
+			name:    "contradictory object",
+			body:    `{"object":"chat.completion.chunk","choices":[{"index":0,"finish_reason":"stop"}]}`,
+			wantErr: true,
+		},
+		{
+			name:    "error envelope with status 200",
+			body:    `{"error":{"message":"upstream failed","type":"server_error"}}`,
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			responseBody := &trackingResponseBody{reader: strings.NewReader(tt.body)}
+			service := NewChatCompletionService(
+				WithDefaultBaseURL("https://example.test/"),
+				WithHTTPClient(httpDoerFunc(func(req *http.Request) (*http.Response, error) {
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     http.Header{"Content-Type": []string{"application/json"}},
+						Body:       responseBody,
+						Request:    req,
+					}, nil
+				})),
+			)
+			res, err := service.New(t.Context(), ChatCompletionNewParams{
+				Model: "m", Messages: []ChatCompletionMessageParamUnion{UserMessage("hi")},
+			})
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("New error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr && res != nil {
+				t.Fatalf("New returned response on error: %+v", res)
+			}
+			if !tt.wantErr && (res == nil || len(res.Choices) != 1) {
+				t.Fatalf("New response = %+v", res)
+			}
+			if !responseBody.closed {
+				t.Fatal("response body was not closed")
+			}
+		})
+	}
+}
+
+func TestNewStreamingJSONRequiresEventStreamAndSetsWireFields(t *testing.T) {
+	var requestBody []byte
+	responseBody := &trackingResponseBody{reader: strings.NewReader(
+		"data: {\"id\":\"r\",\"choices\":[]}\n\n",
+	)}
+	service := NewChatCompletionService(
+		WithDefaultBaseURL("https://example.test/"),
+		WithHTTPClient(httpDoerFunc(func(req *http.Request) (*http.Response, error) {
+			var err error
+			requestBody, err = io.ReadAll(req.Body)
+			if err != nil {
+				return nil, err
+			}
+			if got := req.Header.Get("Accept"); got != "text/event-stream" {
+				return nil, errors.New("streaming request did not ask for text/event-stream")
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header: http.Header{
+					"Content-Type": []string{"text/event-stream; charset=utf-8"},
+				},
+				Body:    responseBody,
+				Request: req,
+			}, nil
+		})),
+	)
+
+	raw := json.RawMessage(`{"model":"m","messages":[],"snapshot":"before"}`)
+	stream := service.NewStreamingJSON(t.Context(), raw)
+	if err := stream.Err(); err != nil {
+		t.Fatalf("NewStreamingJSON: %v", err)
+	}
+	if !stream.Next() {
+		t.Fatalf("Next = false, error = %v", stream.Err())
+	}
+	if got := stream.Current().ID; got != "r" {
+		t.Fatalf("chunk ID = %q, want r", got)
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if !responseBody.closed {
+		t.Fatal("stream response body was not closed")
+	}
+
+	var encoded map[string]any
+	if err := json.Unmarshal(requestBody, &encoded); err != nil {
+		t.Fatalf("request body = %q: %v", requestBody, err)
+	}
+	if encoded["stream"] != true || encoded["snapshot"] != "before" {
+		t.Fatalf("request body = %s", requestBody)
+	}
+	if !bytes.Contains(requestBody, []byte(`"model":"m"`)) {
+		t.Fatalf("request body = %s", requestBody)
+	}
+}
+
+func TestNewStreamingRejectsUnexpectedContentTypeAndClosesBody(t *testing.T) {
+	responseBody := &trackingResponseBody{reader: strings.NewReader(
+		`{"error":{"message":"stream unavailable","type":"server_error"}}`,
+	)}
+	service := NewChatCompletionService(
+		WithDefaultBaseURL("https://example.test/"),
+		WithHTTPClient(httpDoerFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       responseBody,
+				Request:    req,
+			}, nil
+		})),
+	)
+
+	stream := service.NewStreaming(t.Context(), ChatCompletionNewParams{
+		Model: "m", Messages: []ChatCompletionMessageParamUnion{UserMessage("hi")},
+	})
+	var apiErr *APIError
+	if !errors.As(stream.Err(), &apiErr) {
+		t.Fatalf("stream error = %T %v, want *APIError", stream.Err(), stream.Err())
+	}
+	if apiErr.StatusCode != http.StatusOK || apiErr.Message != "stream unavailable" {
+		t.Fatalf("APIError = %+v", apiErr)
+	}
+	if !responseBody.closed {
+		t.Fatal("unexpected-content response body was not closed")
+	}
+	if stream.Next() {
+		t.Fatal("stream produced a chunk after content-type error")
+	}
+}
+
+func TestNewStreamingStrictContentTypeMatrix(t *testing.T) {
+	for _, contentType := range []string{
+		"",
+		"text/plain",
+		"application/x-ndjson",
+		"text/event-stream+json",
+		"text/event-stream; charset",
+	} {
+		name := contentType
+		if name == "" {
+			name = "missing"
+		}
+		t.Run(name, func(t *testing.T) {
+			responseBody := &trackingResponseBody{reader: strings.NewReader("not an SSE response")}
+			service := NewChatCompletionService(
+				WithDefaultBaseURL("https://example.test/"),
+				WithHTTPClient(httpDoerFunc(func(req *http.Request) (*http.Response, error) {
+					header := make(http.Header)
+					if contentType != "" {
+						header.Set("Content-Type", contentType)
+					}
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     header,
+						Body:       responseBody,
+						Request:    req,
+					}, nil
+				})),
+			)
+			stream := service.NewStreaming(t.Context(), ChatCompletionNewParams{
+				Model: "m", Messages: []ChatCompletionMessageParamUnion{UserMessage("hi")},
+			})
+			if stream.Err() == nil {
+				t.Fatal("NewStreaming accepted a non-event-stream media type")
+			}
+			if !responseBody.closed {
+				t.Fatal("rejected response body was not closed")
+			}
+		})
+	}
+}
+
+func TestNewStreamingRejectsMissingResponsePartsWithoutPanic(t *testing.T) {
+	tests := []struct {
+		name string
+		do   httpDoerFunc
+	}{
+		{
+			name: "nil response",
+			do:   func(*http.Request) (*http.Response, error) { return nil, nil },
+		},
+		{
+			name: "nil body",
+			do: func(req *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+					Request:    req,
+				}, nil
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			service := NewChatCompletionService(
+				WithDefaultBaseURL("https://example.test/"), WithHTTPClient(tt.do),
+			)
+			stream := service.NewStreaming(t.Context(), ChatCompletionNewParams{
+				Model: "m", Messages: []ChatCompletionMessageParamUnion{UserMessage("hi")},
+			})
+			if stream.Err() == nil {
+				t.Fatal("NewStreaming succeeded")
+			}
+			if stream.Next() {
+				t.Fatal("stream produced a chunk")
+			}
+		})
 	}
 }

@@ -120,7 +120,16 @@ func WithQueryDel(key string) RequestOption {
 // WithJSONSet returns a RequestOption that sets the top-level key of the
 // serialized JSON body to the given value. The body must be a JSON object.
 func WithJSONSet(key string, value any) RequestOption {
+	raw, snapshotErr := jsonMarshalNoEscape(value)
+	if snapshotErr != nil {
+		// json.UnsupportedValueError may retain a reflect.Value into the
+		// rejected input. An option is long-lived, so keep immutable text only.
+		snapshotErr = fmt.Errorf("%s", snapshotErr)
+	}
 	return RequestOptionFunc(func(r *RequestConfig) (err error) {
+		if snapshotErr != nil {
+			return snapshotErr
+		}
 		m := map[string]json.RawMessage{}
 
 		if r.Body != nil {
@@ -132,14 +141,13 @@ func WithJSONSet(key string, value any) RequestOption {
 				if err := json.Unmarshal(buffer.Bytes(), &m); err != nil {
 					return err
 				}
+				if m == nil {
+					return fmt.Errorf("cannot use WithJSONSet on a body that is not a JSON object")
+				}
 			}
 		}
 
-		raw, err := jsonMarshalNoEscape(value)
-		if err != nil {
-			return err
-		}
-		m[key] = raw
+		m[key] = append(json.RawMessage(nil), raw...)
 
 		b, err := jsonMarshalNoEscape(m)
 		if err != nil {
@@ -163,6 +171,9 @@ func WithJSONDel(key string) RequestOption {
 		if buffer.Len() > 0 {
 			if err := json.Unmarshal(buffer.Bytes(), &m); err != nil {
 				return err
+			}
+			if m == nil {
+				return fmt.Errorf("cannot use WithJSONDel on a body that is not a JSON object")
 			}
 		}
 		delete(m, key)
@@ -206,16 +217,20 @@ func WithResponseInto(dst **http.Response) RequestOption {
 // WithRequestBody returns a RequestOption that provides a custom serialized body with the given
 // content type.
 //
-// body accepts an io.Reader or raw []bytes.
+// A raw byte slice is snapshotted when the option is constructed. An
+// io.Reader cannot be copied generically; callers must keep it immutable and
+// must not reuse the option concurrently until Apply/Execute has consumed it.
 func WithRequestBody(contentType string, body any) RequestOption {
+	if b, ok := body.([]byte); ok {
+		frozen := append([]byte(nil), b...)
+		return RequestOptionFunc(func(r *RequestConfig) error {
+			r.Body = bytes.NewBuffer(append([]byte(nil), frozen...))
+			return r.Apply(WithHeader("Content-Type", contentType))
+		})
+	}
 	return RequestOptionFunc(func(r *RequestConfig) error {
 		if reader, ok := body.(io.Reader); ok {
 			r.Body = reader
-			return r.Apply(WithHeader("Content-Type", contentType))
-		}
-
-		if b, ok := body.([]byte); ok {
-			r.Body = bytes.NewBuffer(b)
 			return r.Apply(WithHeader("Content-Type", contentType))
 		}
 

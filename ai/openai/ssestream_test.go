@@ -87,6 +87,97 @@ func TestStreamRequiresExactDoneMarker(t *testing.T) {
 	if stream.Err() == nil {
 		t.Fatal("Err() = nil, want JSON decoding error for a non-exact [DONE] marker")
 	}
+	var streamErr *StreamError
+	if !errors.As(stream.Err(), &streamErr) {
+		t.Fatalf("Err() type = %T, want *StreamError", stream.Err())
+	}
+	if got := strings.TrimSpace(string(streamErr.Event.Data)); got != "[DONE] trailing-data" {
+		t.Fatalf("StreamError event data = %q", got)
+	}
+}
+
+func TestStreamExplicitErrorEventPreservesFlatAPIError(t *testing.T) {
+	res := &http.Response{Body: io.NopCloser(strings.NewReader(
+		"event: error\n" +
+			`data: {"message":"overloaded","type":"server_error","code":529,"param":"model"}` + "\n\n" +
+			"data: {\"value\":1}\n\n" +
+			"data: [DONE]\n\n",
+	))}
+	stream := NewStream[struct {
+		Value int `json:"value"`
+	}](NewDecoder(res), nil)
+	defer stream.Close()
+
+	if stream.Next() {
+		t.Fatal("Next() returned a value for event: error")
+	}
+	var streamErr *StreamError
+	if !errors.As(stream.Err(), &streamErr) {
+		t.Fatalf("Err() = %T, want *StreamError", stream.Err())
+	}
+	if streamErr.Event.Type != "error" || !strings.Contains(string(streamErr.Event.Data), "overloaded") {
+		t.Fatalf("preserved event = %#v", streamErr.Event)
+	}
+	var apiErr *APIError
+	if !errors.As(stream.Err(), &apiErr) {
+		t.Fatalf("Err() does not unwrap to *APIError: %v", stream.Err())
+	}
+	if apiErr.Message != "overloaded" || apiErr.Type != "server_error" || apiErr.Code != "529" || apiErr.Param != "model" {
+		t.Fatalf("APIError = %#v", apiErr)
+	}
+	if stream.Next() {
+		t.Fatal("stream continued to the success event after event: error")
+	}
+}
+
+func TestStreamExplicitErrorEventAcceptsPlainText(t *testing.T) {
+	res := &http.Response{Body: io.NopCloser(strings.NewReader(
+		"event: error\ndata: overloaded\n\n",
+	))}
+	stream := NewStream[struct{}](NewDecoder(res), nil)
+	defer stream.Close()
+
+	if stream.Next() {
+		t.Fatal("Next() returned a value for event: error")
+	}
+	var apiErr *APIError
+	if !errors.As(stream.Err(), &apiErr) || apiErr.Message != "overloaded" {
+		t.Fatalf("Err() = %#v, want plain-text APIError", stream.Err())
+	}
+}
+
+func TestStreamErrorEnvelopeUnwrapsAPIError(t *testing.T) {
+	res := &http.Response{Body: io.NopCloser(strings.NewReader(
+		`data: {"error":{"message":"quota","type":"rate_limit","code":429}}` + "\n\n",
+	))}
+	stream := NewStream[struct{}](NewDecoder(res), nil)
+	defer stream.Close()
+
+	if stream.Next() {
+		t.Fatal("Next() returned an error envelope as a value")
+	}
+	var streamErr *StreamError
+	var apiErr *APIError
+	if !errors.As(stream.Err(), &streamErr) || !errors.As(stream.Err(), &apiErr) {
+		t.Fatalf("Err() chain = %T %v", stream.Err(), stream.Err())
+	}
+	if apiErr.Code != "429" || apiErr.Body == "" {
+		t.Fatalf("APIError = %#v", apiErr)
+	}
+}
+
+func TestStreamRejectsNullEvent(t *testing.T) {
+	res := &http.Response{Body: io.NopCloser(strings.NewReader("data: null\n\n"))}
+	stream := NewStream[struct{}](NewDecoder(res), nil)
+	defer stream.Close()
+
+	if stream.Next() {
+		t.Fatal("Next() accepted a null event")
+	}
+	var streamErr *StreamError
+	if !errors.As(stream.Err(), &streamErr) || !strings.Contains(streamErr.Error(), "null streaming event") {
+		t.Fatalf("Err() = %#v, want null *StreamError", stream.Err())
+	}
 }
 
 func TestStreamDispatchesFinalDataBlockAtEOF(t *testing.T) {

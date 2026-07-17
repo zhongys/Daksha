@@ -3,8 +3,12 @@ package openai
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
+	"mime"
 	"net/http"
 	"slices"
+	"strings"
 )
 
 type ChatCompletionService struct {
@@ -13,7 +17,7 @@ type ChatCompletionService struct {
 
 func NewChatCompletionService(opts ...RequestOption) (r ChatCompletionService) {
 	r = ChatCompletionService{}
-	r.Options = opts
+	r.Options = slices.Clone(opts)
 	return
 }
 
@@ -22,20 +26,109 @@ func (r *ChatCompletionService) New(ctx context.Context, body ChatCompletionNewP
 	opts = slices.Concat(preClientOpts, r.Options, opts)
 	path := "chat/completions"
 	err = ExecuteNewRequest(ctx, http.MethodPost, path, body, &res, opts...)
-	return res, err
+	if err != nil {
+		return nil, err
+	}
+	if err := validateChatCompletion(res); err != nil {
+		return nil, err
+	}
+	return res, nil
 }
 
 func (r *ChatCompletionService) NewStreaming(ctx context.Context, body ChatCompletionNewParams, opts ...RequestOption) (stream *Stream[ChatCompletionChunk]) {
+	return r.newStreaming(ctx, body, opts...)
+}
+
+// NewStreamingJSON starts a chat-completion stream from an already serialized
+// request snapshot. It is useful to callers that must freeze mutable request
+// fields before handing work to another goroutine.
+func (r *ChatCompletionService) NewStreamingJSON(ctx context.Context, body json.RawMessage, opts ...RequestOption) *Stream[ChatCompletionChunk] {
+	return r.newStreaming(ctx, body, opts...)
+}
+
+func (r *ChatCompletionService) newStreaming(ctx context.Context, body any, opts ...RequestOption) *Stream[ChatCompletionChunk] {
 	var (
 		raw *http.Response
 		err error
 	)
 	preClientOpts := []RequestOption{WithBearerAuthSecurity()}
 	opts = slices.Concat(preClientOpts, r.Options, opts)
-	opts = append(opts, WithJSONSet("stream", true))
+	opts = append(opts, WithJSONSet("stream", true), WithHeader("Accept", "text/event-stream"))
 	path := "chat/completions"
 	err = ExecuteNewRequest(ctx, http.MethodPost, path, body, &raw, opts...)
-	return NewStream[ChatCompletionChunk](NewDecoder(raw), err)
+	if err != nil {
+		closeResponseBody(raw)
+		return NewStream[ChatCompletionChunk](nil, err)
+	}
+	if err := validateStreamingResponse(raw); err != nil {
+		closeResponseBody(raw)
+		return NewStream[ChatCompletionChunk](nil, err)
+	}
+	return NewStream[ChatCompletionChunk](NewDecoder(raw), nil)
+}
+
+func validateChatCompletion(res *ChatCompletion) error {
+	if res == nil {
+		return fmt.Errorf("openai: invalid chat completion response: top-level value is null")
+	}
+	if res.Object != "" && res.Object != "chat.completion" {
+		return fmt.Errorf("openai: invalid chat completion response object %q", res.Object)
+	}
+	if len(res.Choices) == 0 {
+		return fmt.Errorf("openai: invalid chat completion response: choices is empty")
+	}
+
+	seenIndexes := make(map[int64]struct{}, len(res.Choices))
+	for i, choice := range res.Choices {
+		if choice.Index < 0 {
+			return fmt.Errorf("openai: invalid chat completion choice %d: negative index %d", i, choice.Index)
+		}
+		if _, exists := seenIndexes[choice.Index]; exists {
+			return fmt.Errorf("openai: invalid chat completion response: duplicate choice index %d", choice.Index)
+		}
+		seenIndexes[choice.Index] = struct{}{}
+		if choice.FinishReason == "" {
+			return fmt.Errorf("openai: invalid chat completion choice %d: finish_reason is empty", choice.Index)
+		}
+	}
+	return nil
+}
+
+func validateStreamingResponse(res *http.Response) error {
+	if res == nil {
+		return fmt.Errorf("openai: streaming response is nil")
+	}
+	if res.Body == nil {
+		return fmt.Errorf("openai: streaming response body is nil")
+	}
+
+	contentType := res.Header.Get("Content-Type")
+	mediaType, _, parseErr := mime.ParseMediaType(contentType)
+	if parseErr == nil && strings.EqualFold(mediaType, "text/event-stream") {
+		return nil
+	}
+
+	// Some compatible gateways return a JSON error envelope with status 200.
+	// Preserve that structured error even though the advertised media type is
+	// invalid for a streaming response.
+	contents, readErr := io.ReadAll(res.Body)
+	if apiErr := errorFromEventData(contents); apiErr != nil {
+		apiErr.StatusCode = res.StatusCode
+		return apiErr
+	}
+	if readErr != nil {
+		return fmt.Errorf("openai: expected streaming response content-type text/event-stream, got %q; reading response body: %w", contentType, readErr)
+	}
+	if parseErr != nil {
+		return fmt.Errorf("openai: expected streaming response content-type text/event-stream, got %q: %w", contentType, parseErr)
+	}
+	return fmt.Errorf("openai: expected streaming response content-type text/event-stream, got %q", contentType)
+}
+
+func closeResponseBody(res *http.Response) {
+	if res != nil && res.Body != nil {
+		_ = res.Body.Close()
+	}
 }
 
 type ChatCompletion struct {

@@ -3,6 +3,7 @@ package openaicompletions
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -41,6 +42,34 @@ func eventTypes(events []ai.AssistantMessageEvent) []ai.AssistantMessageEventTyp
 		types = append(types, ev.EventType())
 	}
 	return types
+}
+
+func assertSingleTerminalEvent(t *testing.T, events []ai.AssistantMessageEvent, want ai.AssistantMessageEventType) {
+	t.Helper()
+	terminalCount := 0
+	for _, event := range events {
+		switch event.EventType() {
+		case ai.AssistantEventDone, ai.AssistantEventError:
+			terminalCount++
+		}
+	}
+	if terminalCount != 1 {
+		t.Fatalf("terminal event count = %d, events = %v", terminalCount, eventTypes(events))
+	}
+	if len(events) == 0 || events[len(events)-1].EventType() != want {
+		t.Fatalf("events = %v, want terminal %s", eventTypes(events), want)
+	}
+}
+
+func assertNoBlockEndEvents(t *testing.T, events []ai.AssistantMessageEvent) {
+	t.Helper()
+	for _, event := range events {
+		switch event.EventType() {
+		case ai.AssistantEventTextEnd, ai.AssistantEventJSONEnd,
+			ai.AssistantEventThinkingEnd, ai.AssistantEventToolCallEnd:
+			t.Fatalf("error path published block end %s: %v", event.EventType(), eventTypes(events))
+		}
+	}
 }
 
 func sseTextChunk(t *testing.T, content, finishReason string) string {
@@ -324,10 +353,11 @@ func TestSnapshotOutputFormatDetachesSchema(t *testing.T) {
 			},
 		},
 	}
-	snapshot, err := snapshotOutputFormat(original)
+	options, err := ai.SnapshotStreamOptions(ai.StreamOptions{OutputFormat: original})
 	if err != nil {
-		t.Fatalf("snapshotOutputFormat: %v", err)
+		t.Fatalf("SnapshotStreamOptions: %v", err)
 	}
+	snapshot := options.OutputFormat
 
 	nested["type"] = "number"
 	original.JSONSchema.Schema["required"].([]string)[0] = "changed"
@@ -761,7 +791,7 @@ func TestStreamerHTTPErrorEncodedInStream(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUnauthorized)
-		_, _ = w.Write([]byte(`{"error":{"message":"bad key","type":"auth"}}`))
+		_, _ = w.Write([]byte(`{"error":{"message":"bad key","type":"auth","code":40101,"param":"api_key"}}`))
 	}))
 	defer server.Close()
 
@@ -774,18 +804,25 @@ func TestStreamerHTTPErrorEncodedInStream(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Result should carry the message, got err %v", err)
 	}
-	if len(events) != 1 || events[0].EventType() != ai.AssistantEventError {
-		t.Errorf("events = %v", eventTypes(events))
-	}
+	assertSingleTerminalEvent(t, events, ai.AssistantEventError)
 	if msg.StopReason != ai.StopReasonError {
 		t.Errorf("StopReason = %v", msg.StopReason)
+	}
+	if msg.Diagnostics.Type != "error" || msg.Diagnostics.Error.Name != "APIError" ||
+		msg.Diagnostics.Error.Message != "bad key" || msg.Diagnostics.Error.Code != "40101" {
+		t.Fatalf("Diagnostics = %#v", msg.Diagnostics)
+	}
+	if msg.Diagnostics.Details["statusCode"] != http.StatusUnauthorized ||
+		msg.Diagnostics.Details["apiErrorType"] != "auth" || msg.Diagnostics.Details["param"] != "api_key" ||
+		!strings.Contains(msg.Diagnostics.Details["body"].(string), "bad key") {
+		t.Fatalf("diagnostic details = %#v", msg.Diagnostics.Details)
 	}
 }
 
 func TestStreamerErrorEventInStream(t *testing.T) {
 	server := sseServer(t, []string{
 		`{"id":"r","choices":[{"index":0,"delta":{"content":"par"}}]}`,
-		`{"error":{"message":"overloaded","type":"server_error"}}`,
+		`{"error":{"message":"overloaded","type":"server_error","code":529}}`,
 	})
 	defer server.Close()
 
@@ -794,16 +831,22 @@ func TestStreamerErrorEventInStream(t *testing.T) {
 		ai.Provider{BaseURL: server.URL + "/", APIKey: "k"}, ai.Model{ID: "m"},
 		ai.Prompt{Messages: []ai.Message{userText("hi")}}, ai.StreamOptions{})
 
-	_, msg, err := collectStream(t, stream)
+	events, msg, err := collectStream(t, stream)
 	if err != nil {
 		t.Fatalf("Result: %v", err)
 	}
 	if msg.StopReason != ai.StopReasonError {
 		t.Errorf("StopReason = %v", msg.StopReason)
 	}
+	assertSingleTerminalEvent(t, events, ai.AssistantEventError)
+	assertNoBlockEndEvents(t, events)
 	// Partial content survives on the error message.
 	if text, ok := msg.Content[0].(*ai.TextContent); !ok || text.Text != "par" {
 		t.Errorf("content = %+v", msg.Content)
+	}
+	if msg.Diagnostics.Error.Name != "StreamError" || msg.Diagnostics.Error.Message != "overloaded" ||
+		msg.Diagnostics.Error.Code != "529" || msg.Diagnostics.Details["apiErrorType"] != "server_error" {
+		t.Fatalf("Diagnostics = %#v", msg.Diagnostics)
 	}
 }
 
@@ -831,5 +874,244 @@ func TestStreamerStructuredErrorPreservesRawDelta(t *testing.T) {
 	structured, ok := msg.Content[0].(*ai.JSONContent)
 	if !ok || len(structured.Value) != 0 || msg.Diagnostics.Details["rawJSON"] != `{"answer":` {
 		t.Fatalf("structured error message = %#v", msg)
+	}
+}
+
+func TestStreamerExplicitErrorEventIsTerminal(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w,
+			"event: error\n"+
+				`data: {"message":"overloaded","type":"server_error","code":529,"param":"model"}`+"\n\n"+
+				"data: "+sseTextChunk(t, "must not be observed", "stop")+"\n\n"+
+				"data: [DONE]\n\n",
+		)
+	}))
+	defer server.Close()
+
+	stream := NewStreamer().Stream(context.Background(),
+		ai.Provider{BaseURL: server.URL + "/", APIKey: "k"}, ai.Model{ID: "m"},
+		ai.Prompt{Messages: []ai.Message{userText("hi")}}, ai.StreamOptions{})
+	events, msg, err := collectStream(t, stream)
+	if err != nil {
+		t.Fatalf("Result: %v", err)
+	}
+	assertSingleTerminalEvent(t, events, ai.AssistantEventError)
+	if got := eventTypes(events); !reflect.DeepEqual(got, []ai.AssistantMessageEventType{
+		ai.AssistantEventStart, ai.AssistantEventError,
+	}) {
+		t.Fatalf("event sequence = %v", got)
+	}
+	if len(msg.Content) != 0 || msg.ErrorMessage == "" {
+		t.Fatalf("message = %#v", msg)
+	}
+	if msg.Diagnostics.Error.Name != "StreamError" || msg.Diagnostics.Error.Message != "overloaded" ||
+		msg.Diagnostics.Error.Code != "529" {
+		t.Fatalf("Diagnostics = %#v", msg.Diagnostics)
+	}
+	if msg.Diagnostics.Details["eventType"] != "error" ||
+		msg.Diagnostics.Details["apiErrorType"] != "server_error" ||
+		msg.Diagnostics.Details["param"] != "model" ||
+		!strings.Contains(msg.Diagnostics.Details["eventData"].(string), "overloaded") {
+		t.Fatalf("diagnostic details = %#v", msg.Diagnostics.Details)
+	}
+}
+
+func TestStreamerErrorAbortsOpenBlocksBeforeEnd(t *testing.T) {
+	tests := []struct {
+		name   string
+		events []string
+	}{
+		{
+			name: "missing finish after text",
+			events: []string{
+				sseTextChunk(t, "partial", ""),
+				`[DONE]`,
+			},
+		},
+		{
+			name: "missing finish after executable tool payload",
+			events: []string{
+				`{"id":"r","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]}}]}`,
+				`[DONE]`,
+			},
+		},
+		{
+			name: "abnormal finish with text and tool",
+			events: []string{
+				`{"id":"r","choices":[{"index":0,"delta":{"content":"partial","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]},"finish_reason":"content_filter"}]}`,
+				`[DONE]`,
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := sseServer(t, test.events)
+			defer server.Close()
+			stream := NewStreamer().Stream(context.Background(),
+				ai.Provider{BaseURL: server.URL + "/", APIKey: "k"}, ai.Model{ID: "m"},
+				ai.Prompt{Messages: []ai.Message{userText("hi")}}, ai.StreamOptions{})
+			events, msg, err := collectStream(t, stream)
+			if err != nil {
+				t.Fatalf("Result: %v", err)
+			}
+			assertSingleTerminalEvent(t, events, ai.AssistantEventError)
+			assertNoBlockEndEvents(t, events)
+			if msg.StopReason != ai.StopReasonError || len(msg.Content) == 0 {
+				t.Fatalf("message = %#v", msg)
+			}
+		})
+	}
+}
+
+func TestStreamerRejectsEmptyDoneOnlyAndNullStreams(t *testing.T) {
+	tests := []struct {
+		name   string
+		events []string
+	}{
+		{name: "empty stream"},
+		{name: "done only", events: []string{`[DONE]`}},
+		{name: "null event", events: []string{`null`, `[DONE]`}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := sseServer(t, test.events)
+			defer server.Close()
+			stream := NewStreamer().Stream(context.Background(),
+				ai.Provider{BaseURL: server.URL + "/", APIKey: "k"}, ai.Model{ID: "m"},
+				ai.Prompt{Messages: []ai.Message{userText("hi")}}, ai.StreamOptions{})
+			events, msg, err := collectStream(t, stream)
+			if err != nil {
+				t.Fatalf("Result: %v", err)
+			}
+			assertSingleTerminalEvent(t, events, ai.AssistantEventError)
+			assertNoBlockEndEvents(t, events)
+			if got := eventTypes(events); !reflect.DeepEqual(got, []ai.AssistantMessageEventType{
+				ai.AssistantEventStart, ai.AssistantEventError,
+			}) {
+				t.Fatalf("events = %v", got)
+			}
+			if msg.StopReason != ai.StopReasonError || msg.ErrorMessage == "" {
+				t.Fatalf("message = %#v", msg)
+			}
+		})
+	}
+}
+
+func TestStreamerRejectsConflictingFinishReasons(t *testing.T) {
+	for _, reasons := range [][2]string{
+		{"content_filter", "stop"},
+		{"stop", "content_filter"},
+	} {
+		name := reasons[0] + "_then_" + reasons[1]
+		t.Run(name, func(t *testing.T) {
+			server := sseServer(t, []string{
+				sseTextChunk(t, "partial", reasons[0]),
+				sseTextChunk(t, "", reasons[1]),
+				`[DONE]`,
+			})
+			defer server.Close()
+
+			stream := NewStreamer().Stream(context.Background(),
+				ai.Provider{BaseURL: server.URL + "/", APIKey: "k"}, ai.Model{ID: "m"},
+				ai.Prompt{Messages: []ai.Message{userText("hi")}}, ai.StreamOptions{},
+			)
+			events, msg, err := collectStream(t, stream)
+			if err != nil {
+				t.Fatalf("Result: %v", err)
+			}
+			assertSingleTerminalEvent(t, events, ai.AssistantEventError)
+			assertNoBlockEndEvents(t, events)
+			if msg.StopReason != ai.StopReasonError ||
+				!strings.Contains(msg.ErrorMessage, "conflicting finish_reason") {
+				t.Fatalf("message = %#v", msg)
+			}
+		})
+	}
+}
+
+func TestStreamerRejectsContradictoryChunkState(t *testing.T) {
+	tests := []struct {
+		name   string
+		events []string
+		error  string
+	}{
+		{
+			name: "response id changes",
+			events: []string{
+				`{"id":"r1","choices":[{"index":0,"delta":{"content":"partial"}}]}`,
+				`{"id":"r2","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+			},
+			error: "response id changed",
+		},
+		{
+			name: "response model changes",
+			events: []string{
+				`{"model":"m1","choices":[{"index":0,"delta":{"content":"partial"}}]}`,
+				`{"model":"m2","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+			},
+			error: "response model changed",
+		},
+		{
+			name: "choice index changes",
+			events: []string{
+				`{"choices":[{"index":0,"delta":{"content":"partial"}}]}`,
+				`{"choices":[{"index":1,"delta":{},"finish_reason":"stop"}]}`,
+			},
+			error: "choice index changed",
+		},
+		{
+			name: "multiple choices",
+			events: []string{
+				`{"choices":[{"index":0,"delta":{}},{"index":1,"delta":{}}]}`,
+			},
+			error: "exactly one is supported",
+		},
+		{
+			name: "wrong object",
+			events: []string{
+				`{"object":"chat.completion","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+			},
+			error: "invalid streaming response object",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := sseServer(t, append(test.events, `[DONE]`))
+			defer server.Close()
+			stream := NewStreamer().Stream(context.Background(),
+				ai.Provider{BaseURL: server.URL + "/", APIKey: "k"}, ai.Model{ID: "m"},
+				ai.Prompt{Messages: []ai.Message{userText("hi")}}, ai.StreamOptions{},
+			)
+			events, msg, err := collectStream(t, stream)
+			if err != nil {
+				t.Fatalf("Result: %v", err)
+			}
+			assertSingleTerminalEvent(t, events, ai.AssistantEventError)
+			assertNoBlockEndEvents(t, events)
+			if msg.StopReason != ai.StopReasonError || !strings.Contains(msg.ErrorMessage, test.error) {
+				t.Fatalf("message = %#v", msg)
+			}
+		})
+	}
+}
+
+func TestStreamerCancellationIsStreamMechanicsFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	stream := NewStreamer().Stream(ctx, ai.Provider{}, ai.Model{ID: "m"}, ai.Prompt{},
+		ai.StreamOptions{OutputFormat: ai.OutputFormat{Type: "invalid"}},
+	)
+	events, msg, err := collectStream(t, stream)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Result error = %v, want context.Canceled", err)
+	}
+	if msg != nil {
+		t.Fatalf("Result message = %#v, want nil", msg)
+	}
+	if len(events) != 0 {
+		t.Fatalf("canceled stream events = %v, want none", eventTypes(events))
 	}
 }
