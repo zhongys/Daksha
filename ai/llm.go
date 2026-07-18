@@ -65,9 +65,9 @@ type Model struct {
 	// Pricing is the per-token price in nano-yuan; zero means free/unknown
 	// and yields a zero Cost.
 	Pricing Pricing
-	// ContextWindow and MaxOutputTokens inform the agent layer's budgeting.
-	// They never alter requests: an unset StreamOptions.MaxTokens stays
-	// unset and the vendor default applies.
+	// ContextWindow and MaxOutputTokens are catalog metadata for host-side
+	// budgeting. They never alter requests: an unset StreamOptions.MaxTokens
+	// stays unset and the vendor default applies.
 	ContextWindow   int64
 	MaxOutputTokens int64
 

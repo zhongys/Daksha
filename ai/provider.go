@@ -5,6 +5,11 @@ package ai
 // vendor means adding an entry to a Client's registry. Only a genuinely
 // different wire protocol (e.g. Anthropic Messages) warrants a new adapter
 // package next to ai/api/openaicompletions.
+//
+// Provider is trusted host-application configuration, not an untrusted wire
+// DTO. Applications that accept dynamic provider configuration are responsible
+// for authorization, URL and egress validation, credential isolation, and
+// restricting Compat and Extra before calling Client.PutProvider.
 type Provider struct {
 	Name    string
 	BaseURL string
