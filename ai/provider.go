@@ -28,38 +28,3 @@ type Provider struct {
 	// JSON tree types rather than preserving caller-specific concrete Go types.
 	Extra map[string]any
 }
-
-// SeedProviders returns starter entries for well-known endpoints. Pure data,
-// no side effects: main decides whether to load them into a Client. The model
-// catalog has no seed — its source of truth is the application's storage.
-func SeedProviders() []Provider {
-	return []Provider{
-		{
-			Name:      "openai",
-			BaseURL:   "https://api.openai.com/v1/",
-			APIKeyEnv: "OPENAI_API_KEY",
-		},
-		{
-			Name:      "deepseek",
-			BaseURL:   "https://api.deepseek.com/",
-			APIKeyEnv: "DEEPSEEK_API_KEY",
-		},
-		{
-			Name:      "qwen",
-			BaseURL:   "https://dashscope.aliyuncs.com/compatible-mode/v1/",
-			APIKeyEnv: "DASHSCOPE_API_KEY",
-		},
-		{
-			Name:      "kimi",
-			BaseURL:   "https://api.moonshot.cn/v1/",
-			APIKeyEnv: "MOONSHOT_API_KEY",
-			// This provider is intentionally scoped to Kimi K3. Moonshot's
-			// legacy models used max_tokens, while K3 follows the current
-			// max_completion_tokens field and OpenAI-style reasoning_effort.
-			Compat: &OpenAICompat{
-				MaxTokensField: "max_completion_tokens",
-				ThinkingFormat: ThinkingFormatOpenAI,
-			},
-		},
-	}
-}

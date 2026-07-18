@@ -14,15 +14,20 @@ func main() {
 	client := ai.NewClient(map[string]ai.Streamer{
 		"openai-completions": openaicompletions.NewStreamer(),
 	})
-	for _, p := range ai.SeedProviders() {
-		if err := client.PutProvider(p); err != nil {
-			panic(err)
-		}
+
+	// Providers and models belong to the application. A production service
+	// loads these values from its database or configuration service; this demo
+	// injects one provider explicitly to show the same boundary.
+	const providerName = "moonshot-production"
+	if err := client.PutProvider(ai.Provider{
+		Name:      providerName,
+		BaseURL:   "https://api.moonshot.cn/v1/",
+		APIKeyEnv: "MOONSHOT_API_KEY",
+	}); err != nil {
+		panic(err)
 	}
-	// In production the model catalog is synced from the database. This local
-	// entry mirrors the Kimi K3 capabilities and limits documented by Moonshot.
 	if err := client.PutModel(ai.Model{
-		Provider:        "kimi",
+		Provider:        providerName,
 		ID:              "kimi-k3",
 		Reasoning:       true,
 		ToolCall:        true,
@@ -37,7 +42,7 @@ func main() {
 	// agent layer assembly: the application talks to the Agent only.
 	a, err := agent.New(agent.Config{
 		LLM:          client,
-		Provider:     "kimi",
+		Provider:     providerName,
 		Model:        "kimi-k3",
 		SystemPrompt: "You are a concise assistant.",
 		MaxTurns:     8,

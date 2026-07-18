@@ -28,7 +28,8 @@ const (
 // Zero/nil fields are auto-detected from the provider's base URL.
 type OpenAICompat struct {
 	// Which request field carries the token limit:
-	// "max_completion_tokens" (OpenAI) or "max_tokens" (Moonshot etc.).
+	// "max_completion_tokens" (current OpenAI-compatible APIs) or the legacy
+	// "max_tokens" field used by endpoints such as DeepSeek.
 	MaxTokensField string
 	ThinkingFormat ThinkingFormat
 	// Whether the endpoint accepts the "developer" role for instructions on
