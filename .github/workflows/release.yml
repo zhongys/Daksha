@@ -1,0 +1,274 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: SemVer tag to publish, for example v0.1.0 or v0.1.0-rc.1
+        required: true
+        type: string
+      release_controls_confirmed:
+        description: Confirm release environment, tag rulesets, and immutable releases are enabled
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  GOTOOLCHAIN: local
+  RELEASE_VERSION: ${{ inputs.version }}
+  RELEASE_CONTROLS_CONFIRMED: ${{ inputs.release_controls_confirmed }}
+
+jobs:
+  verify:
+    name: Verify release
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out main
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.5'
+          cache: true
+
+      - name: Validate release input
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "Releases must be dispatched from the main branch."
+            exit 1
+          fi
+          if [[ "$RELEASE_CONTROLS_CONFIRMED" != "true" ]]; then
+            echo "Confirm the mandatory repository release controls before publishing."
+            exit 1
+          fi
+
+          semver='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+          if [[ ! "$RELEASE_VERSION" =~ $semver ]]; then
+            echo "Invalid Go module version: $RELEASE_VERSION"
+            exit 1
+          fi
+          if [[ "$RELEASE_VERSION" == *-* ]]; then
+            prerelease="${RELEASE_VERSION#*-}"
+            IFS='.' read -r -a identifiers <<< "$prerelease"
+            for identifier in "${identifiers[@]}"; do
+              if [[ "$identifier" =~ ^0[0-9]+$ ]]; then
+                echo "Numeric prerelease identifiers must not contain leading zeroes: $identifier"
+                exit 1
+              fi
+            done
+          fi
+
+          git fetch origin main --tags
+          if [[ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]]; then
+            echo "The release commit must be the current origin/main tip."
+            exit 1
+          fi
+
+          changelog_version="${RELEASE_VERSION#v}"
+          heading_prefix="## [$changelog_version] - "
+          mapfile -t changelog_headings < <(
+            awk -v prefix="$heading_prefix" 'index($0, prefix) == 1 { print }' CHANGELOG.md
+          )
+          if [[ "${#changelog_headings[@]}" -ne 1 ]]; then
+            echo "CHANGELOG.md must contain exactly one dated heading for $changelog_version."
+            exit 1
+          fi
+          release_date="${changelog_headings[0]#"$heading_prefix"}"
+          if [[ ! "$release_date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+            echo "CHANGELOG.md release date must use YYYY-MM-DD: $release_date"
+            exit 1
+          fi
+          if ! normalized_date="$(date -u -d "$release_date" +%F 2>/dev/null)" ||
+            [[ "$normalized_date" != "$release_date" ]]; then
+            echo "CHANGELOG.md contains an invalid release date: $release_date"
+            exit 1
+          fi
+
+          module_path="$(go list -m)"
+          major="${RELEASE_VERSION#v}"
+          major="${major%%.*}"
+          if (( major >= 2 )); then
+            expected="github.com/zhongys/Daksha/v$major"
+          else
+            expected="github.com/zhongys/Daksha"
+          fi
+          if [[ "$module_path" != "$expected" ]]; then
+            echo "Module path $module_path does not match release major v$major ($expected)."
+            exit 1
+          fi
+
+          if git show-ref --verify --quiet "refs/tags/$RELEASE_VERSION"; then
+            if [[ "$(git cat-file -t "$RELEASE_VERSION")" != "tag" ]]; then
+              echo "Existing $RELEASE_VERSION is not an annotated tag."
+              exit 1
+            fi
+            if [[ "$(git rev-list -n 1 "$RELEASE_VERSION")" != "$GITHUB_SHA" ]]; then
+              echo "Existing $RELEASE_VERSION points to a different commit and will not be moved."
+              exit 1
+            fi
+          fi
+
+      - name: Check formatting and module metadata
+        shell: bash
+        run: |
+          unformatted="$(gofmt -l $(git ls-files '*.go'))"
+          if [[ -n "$unformatted" ]]; then
+            echo "$unformatted"
+            exit 1
+          fi
+          empty_tree="$(git hash-object -t tree /dev/null)"
+          git diff --check "$empty_tree" HEAD
+          go mod tidy -diff
+          go mod verify
+
+      - name: Vet and test
+        run: |
+          go vet ./...
+          go test -shuffle=on -count=1 -timeout=10m ./...
+
+      - name: Test with race detector
+        env:
+          CGO_ENABLED: '1'
+        run: go test -race -shuffle=on -count=1 -timeout=15m ./...
+
+      - name: Scan reachable vulnerabilities
+        uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f # v1.1.0
+        with:
+          go-version-input: '1.26.5'
+          go-package: ./...
+          repo-checkout: false
+          output-format: text
+
+  publish:
+    name: Publish release
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - name: Check out verified commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+
+      - name: Verify immutable release policy
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_SETTINGS_TOKEN }}
+        shell: bash
+        run: |
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "The release environment must provide RELEASE_SETTINGS_TOKEN."
+            exit 1
+          fi
+          if ! enabled="$(gh api "repos/$GITHUB_REPOSITORY/immutable-releases" \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            --jq '.enabled' 2>/dev/null)" || [[ "$enabled" != "true" ]]; then
+            echo "Immutable Releases are not enabled or cannot be verified."
+            exit 1
+          fi
+
+      - name: Create annotated release tag
+        shell: bash
+        run: |
+          git fetch origin main --tags
+          if [[ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]]; then
+            echo "origin/main changed after verification; start a new release run."
+            exit 1
+          fi
+
+          if git show-ref --verify --quiet "refs/tags/$RELEASE_VERSION"; then
+            if [[ "$(git cat-file -t "$RELEASE_VERSION")" != "tag" ]]; then
+              echo "Existing $RELEASE_VERSION is not an annotated tag."
+              exit 1
+            fi
+            if [[ "$(git rev-list -n 1 "$RELEASE_VERSION")" != "$GITHUB_SHA" ]]; then
+              echo "Existing tag points to another commit and will not be moved."
+              exit 1
+            fi
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "$RELEASE_VERSION" -m "Release $RELEASE_VERSION"
+            git push origin "refs/tags/$RELEASE_VERSION"
+          fi
+
+          git fetch --force origin \
+            "refs/tags/$RELEASE_VERSION:refs/tags/$RELEASE_VERSION"
+          if [[ "$(git cat-file -t "$RELEASE_VERSION")" != "tag" ]] ||
+            [[ "$(git rev-list -n 1 "$RELEASE_VERSION")" != "$GITHUB_SHA" ]]; then
+            echo "Remote release tag changed during publication."
+            exit 1
+          fi
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          expected_prerelease=false
+          if [[ "$RELEASE_VERSION" == *-* ]]; then
+            expected_prerelease=true
+          fi
+
+          validate_release() {
+            local metadata tag_name is_draft is_prerelease is_immutable
+            metadata="$(gh release view "$RELEASE_VERSION" \
+              --json tagName,isDraft,isPrerelease,isImmutable \
+              --jq '[.tagName, .isDraft, .isPrerelease, .isImmutable] | @tsv')"
+            IFS=$'\t' read -r tag_name is_draft is_prerelease is_immutable <<< "$metadata"
+
+            if [[ "$tag_name" != "$RELEASE_VERSION" || "$is_draft" != "false" ||
+              "$is_prerelease" != "$expected_prerelease" || "$is_immutable" != "true" ]]; then
+              echo "Release metadata is invalid: $metadata"
+              exit 1
+            fi
+
+            local verified=false
+            for attempt in 1 2 3 4 5 6; do
+              if gh release verify "$RELEASE_VERSION"; then
+                verified=true
+                break
+              fi
+              if [[ "$attempt" -lt 6 ]]; then
+                sleep 5
+              fi
+            done
+            if [[ "$verified" != "true" ]]; then
+              echo "Release attestation verification failed."
+              exit 1
+            fi
+          }
+
+          if gh release view "$RELEASE_VERSION" >/dev/null 2>&1; then
+            validate_release
+            exit 0
+          fi
+
+          release_args=(
+            --verify-tag
+            --generate-notes
+            --fail-on-no-commits
+            --title "$RELEASE_VERSION"
+          )
+          if [[ "$expected_prerelease" == "true" ]]; then
+            release_args+=(--prerelease --latest=false)
+          fi
+          gh release create "$RELEASE_VERSION" "${release_args[@]}"
+          validate_release
