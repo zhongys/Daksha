@@ -58,6 +58,14 @@ func TestBuildParamsThinkingFormats(t *testing.T) {
 			want:     []string{`"enable_thinking":true`},
 		},
 		{
+			// Thinking-only DashScope models 400 on enable_thinking=false;
+			// empty effort must omit the field, not send an explicit disable.
+			name:     "qwen empty effort omits enable_thinking",
+			provider: ai.Provider{Name: "qwen", BaseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1/"},
+			model:    ai.Model{Provider: "qwen", ID: "qwen-max-thinking", Reasoning: true},
+			notWant:  []string{"enable_thinking"},
+		},
+		{
 			name:     "openrouter reasoning effort",
 			provider: ai.Provider{Name: "openrouter", BaseURL: "https://openrouter.ai/api/v1/"},
 			model:    ai.Model{Provider: "openrouter", ID: "deepseek/deepseek-r1", Reasoning: true},

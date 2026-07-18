@@ -22,7 +22,9 @@ type resolvedCompat struct {
 
 func detectCompat(baseURL string) resolvedCompat {
 	isDeepSeek := strings.Contains(baseURL, "deepseek.com")
-	isQwen := strings.Contains(baseURL, "maas.aliyuncs.com")
+	// Both Alibaba endpoints speak the qwen dialect: classic DashScope
+	// (dashscope.aliyuncs.com/compatible-mode) and Model Studio (maas.aliyuncs.com).
+	isQwen := strings.Contains(baseURL, "dashscope") || strings.Contains(baseURL, "maas.aliyuncs.com")
 	isOpenRouter := strings.Contains(baseURL, "openrouter.ai")
 	isZai := strings.Contains(baseURL, "bigmodel.cn") || strings.Contains(baseURL, "api.z.ai")
 	isMoonshot := strings.Contains(baseURL, "api.moonshot.")
@@ -181,7 +183,13 @@ func applyThinkingFormat(params *openai.ChatCompletionNewParams, model ai.Model,
 			params.ExtraFields["thinking"] = map[string]any{"type": "disabled"}
 		}
 	case ai.ThinkingFormatQwen:
-		params.ExtraFields["enable_thinking"] = enabled
+		// Omit the field entirely when disabled: DashScope's thinking-only
+		// models reject enable_thinking=false outright (400 "restricted to
+		// True"), and hybrid commercial models default to no thinking — so
+		// absence still reads as "off" wherever off exists.
+		if enabled {
+			params.ExtraFields["enable_thinking"] = true
+		}
 	case ai.ThinkingFormatZai:
 		if enabled {
 			params.ExtraFields["thinking"] = map[string]any{"type": "enabled"}

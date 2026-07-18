@@ -159,7 +159,10 @@ type StreamOptions struct {
 	// ToolChoice is "", "auto", "none" or "required".
 	ToolChoice string
 	// ReasoningEffort enables thinking on reasoning models: "minimal", "low",
-	// "medium" or "high". Empty disables thinking where the vendor allows it.
+	// "medium" or "high". Empty disables thinking where the vendor accepts an
+	// explicit disable (deepseek/zai); formats whose vendors reject explicit
+	// disables on always-thinking models (qwen) omit the field instead, falling
+	// back to the vendor default.
 	ReasoningEffort string
 	// OutputFormat is the protocol-neutral final-output contract. The zero value
 	// leaves the provider default unchanged.
