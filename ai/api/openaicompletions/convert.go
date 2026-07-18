@@ -45,8 +45,12 @@ func detectCompat(baseURL string) resolvedCompat {
 	case isZai:
 		c.thinkingFormat = ai.ThinkingFormatZai
 	}
-	if isDeepSeek || isQwen || isZai || isMoonshot {
+	if isDeepSeek || isZai || isMoonshot {
 		c.maxTokensField = "max_tokens"
+	}
+	// DashScope accepts the standard max_completion_tokens nowadays; qwen
+	// only keeps the developer-role quirk.
+	if isDeepSeek || isQwen || isZai || isMoonshot {
 		c.supportsDeveloperRole = false
 	}
 	return c

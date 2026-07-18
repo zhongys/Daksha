@@ -135,6 +135,13 @@ func TestBuildParamsMaxTokensField(t *testing.T) {
 	if !strings.Contains(got, `"max_tokens":500`) || strings.Contains(got, "max_completion_tokens") {
 		t.Errorf("deepseek: %s", got)
 	}
+
+	// DashScope accepts the standard field now — no max_tokens special-casing.
+	params, _ = buildParams(ai.Provider{BaseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1/"},
+		ai.Model{ID: "qwen-plus"}, prompt, opts)
+	if got := marshalParams(t, params); !strings.Contains(got, `"max_completion_tokens":500`) {
+		t.Errorf("dashscope: %s", got)
+	}
 }
 
 func TestBuildParamsExtraPrecedence(t *testing.T) {
