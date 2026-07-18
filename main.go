@@ -19,13 +19,17 @@ func main() {
 			panic(err)
 		}
 	}
-	// In production the model catalog is synced from the database. Pricing
-	// is nano-yuan per token: ¥4/MTok in, ¥16/MTok out, ¥0.8/MTok cache read.
+	// In production the model catalog is synced from the database. This local
+	// entry mirrors the Kimi K3 capabilities and limits documented by Moonshot.
 	if err := client.PutModel(ai.Model{
-		Provider: "deepseek",
-		ID:       "deepseek-chat",
-		ToolCall: true,
-		Pricing:  ai.Pricing{Input: 4000, Output: 16000, CacheRead: 800},
+		Provider:        "kimi",
+		ID:              "kimi-k3",
+		Reasoning:       true,
+		ToolCall:        true,
+		ImageInput:      true,
+		VideoInput:      true,
+		ContextWindow:   1_048_576,
+		MaxOutputTokens: 1_048_576,
 	}); err != nil {
 		panic(err)
 	}
@@ -33,8 +37,8 @@ func main() {
 	// agent layer assembly: the application talks to the Agent only.
 	a, err := agent.New(agent.Config{
 		LLM:          client,
-		Provider:     "deepseek",
-		Model:        "deepseek-chat",
+		Provider:     "kimi",
+		Model:        "kimi-k3",
 		SystemPrompt: "You are a concise assistant.",
 		MaxTurns:     8,
 	})

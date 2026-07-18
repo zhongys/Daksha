@@ -29,9 +29,8 @@ type ChatCompletionNewParams struct {
 	ParallelToolCalls *bool            `json:"parallel_tool_calls,omitzero"`
 	User              *string          `json:"user,omitzero"`
 	LogitBias         map[string]int64 `json:"logit_bias,omitzero"`
-	// Constrains effort on reasoning for reasoning models.
-	//
-	// Any of "minimal", "low", "medium", "high".
+	// Constrains effort on reasoning models. Accepted values are provider-
+	// specific; Kimi K3 currently accepts only "max".
 	ReasoningEffort string                           `json:"reasoning_effort,omitzero"`
 	Stop            ChatCompletionNewParamsStopUnion `json:"stop,omitzero"`
 	// Options for streaming response. Only set this when you set `stream: true`.

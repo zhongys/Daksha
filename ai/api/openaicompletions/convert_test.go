@@ -144,6 +144,104 @@ func TestBuildParamsMaxTokensField(t *testing.T) {
 	}
 }
 
+func TestBuildParamsKimiK3CompatIsIsolated(t *testing.T) {
+	prompt := ai.Prompt{Messages: []ai.Message{userText("hi")}}
+	opts := ai.StreamOptions{
+		Temperature:     openai.Float(1.0),
+		TopP:            openai.Float(0.95),
+		MaxTokens:       openai.Int(500),
+		ToolChoice:      "required",
+		ReasoningEffort: "max",
+	}
+	kimi := ai.Provider{
+		Name: "kimi", BaseURL: "https://api.moonshot.cn/v1/",
+		Compat: &ai.OpenAICompat{
+			MaxTokensField: "max_completion_tokens",
+			ThinkingFormat: ai.ThinkingFormatOpenAI,
+		},
+	}
+	model := ai.Model{Provider: "kimi", ID: "kimi-k3", Reasoning: true, ToolCall: true}
+
+	params, err := buildParams(kimi, model, prompt, opts)
+	if err != nil {
+		t.Fatalf("buildParams: %v", err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal([]byte(marshalParams(t, params)), &body); err != nil {
+		t.Fatalf("unmarshal request: %v", err)
+	}
+	if body["model"] != "kimi-k3" {
+		t.Errorf("model = %#v", body["model"])
+	}
+	if body["max_completion_tokens"] != float64(500) {
+		t.Errorf("max_completion_tokens = %#v", body["max_completion_tokens"])
+	}
+	if body["reasoning_effort"] != "max" {
+		t.Errorf("reasoning_effort = %#v", body["reasoning_effort"])
+	}
+	for _, key := range []string{"max_tokens", "thinking", "enable_thinking", "reasoning"} {
+		if _, ok := body[key]; ok {
+			t.Errorf("unexpected %s in request: %#v", key, body[key])
+		}
+	}
+
+	// The override belongs to the dedicated Kimi provider. A separate legacy
+	// Moonshot entry keeps the existing auto-detected max_tokens behavior.
+	legacyParams, err := buildParams(
+		ai.Provider{Name: "legacy-moonshot", BaseURL: "https://api.moonshot.cn/v1/"},
+		ai.Model{Provider: "legacy-moonshot", ID: "moonshot-v1-8k"}, prompt,
+		ai.StreamOptions{MaxTokens: openai.Int(500)},
+	)
+	if err != nil {
+		t.Fatalf("legacy buildParams: %v", err)
+	}
+	var legacyBody map[string]any
+	if err := json.Unmarshal([]byte(marshalParams(t, legacyParams)), &legacyBody); err != nil {
+		t.Fatalf("unmarshal legacy request: %v", err)
+	}
+	if legacyBody["max_tokens"] != float64(500) {
+		t.Errorf("legacy max_tokens = %#v", legacyBody["max_tokens"])
+	}
+	if _, ok := legacyBody["max_completion_tokens"]; ok {
+		t.Errorf("legacy request unexpectedly contains max_completion_tokens")
+	}
+}
+
+func TestBuildParamsKimiK3ValidatesFixedOptions(t *testing.T) {
+	provider := ai.Provider{
+		Name: "kimi", BaseURL: "https://api.moonshot.cn/v1/",
+		Compat: &ai.OpenAICompat{MaxTokensField: "max_completion_tokens"},
+	}
+	model := ai.Model{Provider: "kimi", ID: "kimi-k3", Reasoning: true}
+	prompt := ai.Prompt{Messages: []ai.Message{userText("hi")}}
+
+	tests := []struct {
+		name  string
+		model ai.Model
+		opts  ai.StreamOptions
+		want  string
+	}{
+		{name: "reasoning capability", model: ai.Model{Provider: "kimi", ID: "kimi-k3"}, want: "reasoning model"},
+		{name: "reasoning effort", model: model, opts: ai.StreamOptions{ReasoningEffort: "high"}, want: "reasoning effort"},
+		{name: "temperature", model: model, opts: ai.StreamOptions{Temperature: openai.Float(0.7)}, want: "temperature"},
+		{name: "top p", model: model, opts: ai.StreamOptions{TopP: openai.Float(0.9)}, want: "top_p"},
+		{name: "max completion tokens", model: model, opts: ai.StreamOptions{MaxTokens: openai.Int(1_048_577)}, want: "max completion tokens"},
+		{name: "tool choice", model: model, opts: ai.StreamOptions{ToolChoice: "function"}, want: "tool choice"},
+		{name: "stop count", model: model, opts: ai.StreamOptions{StopSequences: []string{"1", "2", "3", "4", "5", "6"}}, want: "at most 5"},
+		{name: "stop length", model: model, opts: ai.StreamOptions{StopSequences: []string{strings.Repeat("x", 33)}}, want: "exceeds 32 bytes"},
+		{name: "thinking extra", model: model, opts: ai.StreamOptions{Extra: map[string]any{"thinking": map[string]any{"type": "enabled"}}}, want: "extra field"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := buildParams(provider, tt.model, prompt, tt.opts)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("buildParams error = %v, want substring %q", err, tt.want)
+			}
+		})
+	}
+}
+
 func TestBuildParamsExtraPrecedence(t *testing.T) {
 	prompt := ai.Prompt{Messages: []ai.Message{userText("hi")}}
 	provider := ai.Provider{

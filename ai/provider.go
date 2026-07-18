@@ -49,5 +49,17 @@ func SeedProviders() []Provider {
 			BaseURL:   "https://dashscope.aliyuncs.com/compatible-mode/v1/",
 			APIKeyEnv: "DASHSCOPE_API_KEY",
 		},
+		{
+			Name:      "kimi",
+			BaseURL:   "https://api.moonshot.cn/v1/",
+			APIKeyEnv: "MOONSHOT_API_KEY",
+			// This provider is intentionally scoped to Kimi K3. Moonshot's
+			// legacy models used max_tokens, while K3 follows the current
+			// max_completion_tokens field and OpenAI-style reasoning_effort.
+			Compat: &OpenAICompat{
+				MaxTokensField: "max_completion_tokens",
+				ThinkingFormat: ThinkingFormatOpenAI,
+			},
+		},
 	}
 }

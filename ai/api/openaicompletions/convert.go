@@ -20,6 +20,8 @@ type resolvedCompat struct {
 	requiresReasoningContentOnAssistantMessages bool
 }
 
+const kimiK3MaxCompletionTokens int64 = 1_048_576
+
 func detectCompat(baseURL string) resolvedCompat {
 	isDeepSeek := strings.Contains(baseURL, "deepseek.com")
 	// Both Alibaba endpoints speak the qwen dialect: classic DashScope
@@ -79,6 +81,9 @@ func resolveCompat(provider ai.Provider) resolvedCompat {
 
 func buildParams(provider ai.Provider, model ai.Model, prompt ai.Prompt, opts ai.StreamOptions) (openai.ChatCompletionNewParams, error) {
 	compat := resolveCompat(provider)
+	if err := validateKimiK3Options(provider, model, opts); err != nil {
+		return openai.ChatCompletionNewParams{}, err
+	}
 	if err := opts.OutputFormat.Validate(); err != nil {
 		return openai.ChatCompletionNewParams{}, err
 	}
@@ -141,6 +146,72 @@ func buildParams(provider ai.Provider, model ai.Model, prompt ai.Prompt, opts ai
 		}
 	}
 	return params, nil
+}
+
+// validateKimiK3Options keeps K3's fixed request contract local to the
+// dedicated "kimi" provider. Other providers and even legacy Moonshot
+// entries continue through the generic OpenAI-compatible path unchanged.
+func validateKimiK3Options(provider ai.Provider, model ai.Model, opts ai.StreamOptions) error {
+	if provider.Name != "kimi" || model.ID != "kimi-k3" {
+		return nil
+	}
+	if !model.Reasoning {
+		return fmt.Errorf("openai: kimi-k3 must be configured as a reasoning model")
+	}
+	if opts.ReasoningEffort != "" && opts.ReasoningEffort != "max" {
+		return fmt.Errorf("openai: kimi-k3 reasoning effort must be %q, got %q", "max", opts.ReasoningEffort)
+	}
+	if opts.Temperature != nil && *opts.Temperature != 1.0 {
+		return fmt.Errorf("openai: kimi-k3 temperature is fixed at 1.0, got %v", *opts.Temperature)
+	}
+	if opts.TopP != nil && *opts.TopP != 0.95 {
+		return fmt.Errorf("openai: kimi-k3 top_p is fixed at 0.95, got %v", *opts.TopP)
+	}
+	if opts.MaxTokens != nil && (*opts.MaxTokens < 1 || *opts.MaxTokens > kimiK3MaxCompletionTokens) {
+		return fmt.Errorf("openai: kimi-k3 max completion tokens must be between 1 and %d, got %d",
+			kimiK3MaxCompletionTokens, *opts.MaxTokens)
+	}
+	switch opts.ToolChoice {
+	case "", "auto", "none", "required":
+	default:
+		return fmt.Errorf("openai: kimi-k3 unsupported tool choice %q", opts.ToolChoice)
+	}
+	if len(opts.StopSequences) > 5 {
+		return fmt.Errorf("openai: kimi-k3 supports at most 5 stop sequences, got %d", len(opts.StopSequences))
+	}
+	for i, stop := range opts.StopSequences {
+		if len(stop) > 32 {
+			return fmt.Errorf("openai: kimi-k3 stop sequence %d exceeds 32 bytes", i)
+		}
+	}
+
+	for _, extra := range []struct {
+		scope  string
+		fields map[string]any
+	}{
+		{scope: "provider", fields: provider.Extra},
+		{scope: "model", fields: model.Extra},
+		{scope: "request", fields: opts.Extra},
+	} {
+		for key := range extra.fields {
+			if isKimiK3ReservedExtraField(key) {
+				return fmt.Errorf("openai: kimi-k3 %s extra field %q must use the typed option or be omitted",
+					extra.scope, key)
+			}
+		}
+	}
+	return nil
+}
+
+func isKimiK3ReservedExtraField(key string) bool {
+	switch key {
+	case "thinking", "enable_thinking", "reasoning", "reasoning_effort",
+		"max_tokens", "max_completion_tokens", "temperature", "top_p", "n",
+		"presence_penalty", "frequency_penalty", "tool_choice":
+		return true
+	default:
+		return false
+	}
 }
 
 func applyOutputFormat(params *openai.ChatCompletionNewParams, format ai.OutputFormat) error {

@@ -158,11 +158,10 @@ type StreamOptions struct {
 	StopSequences []string
 	// ToolChoice is "", "auto", "none" or "required".
 	ToolChoice string
-	// ReasoningEffort enables thinking on reasoning models: "minimal", "low",
-	// "medium" or "high". Empty disables thinking where the vendor accepts an
-	// explicit disable (deepseek/zai); formats whose vendors reject explicit
-	// disables on always-thinking models (qwen) omit the field instead, falling
-	// back to the vendor default.
+	// ReasoningEffort is provider-specific. OpenAI-style providers commonly use
+	// "minimal", "low", "medium" or "high"; Kimi K3 currently accepts only
+	// "max". Empty uses the provider default, or disables thinking where the
+	// vendor accepts an explicit disable (deepseek/zai).
 	ReasoningEffort string
 	// OutputFormat is the protocol-neutral final-output contract. The zero value
 	// leaves the provider default unchanged.
