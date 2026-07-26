@@ -21,6 +21,12 @@ func UnmarshalMessage(data []byte) (Message, error) {
 	if err := json.Unmarshal(data, &probe); err != nil {
 		return nil, fmt.Errorf("ai: unmarshal message: %w", err)
 	}
+
+	if probe.Role == "" {
+		return nil, fmt.Errorf(
+			"ai: message: missing role discriminant",
+		)
+	}
 	switch probe.Role {
 	case RoleUser:
 		var m UserMessage
@@ -142,52 +148,102 @@ func contentType(raw json.RawMessage) (ContentType, error) {
 	if err := json.Unmarshal(raw, &probe); err != nil {
 		return "", fmt.Errorf("ai: unmarshal content: %w", err)
 	}
+
+	if probe.Type == "" {
+		return "", fmt.Errorf(
+			"ai: content: missing type discriminant",
+		)
+	}
 	return probe.Type, nil
 }
 
-func unmarshalUserContent(raw json.RawMessage) (UserContent, error) {
+func unmarshalContent(raw json.RawMessage) (Content, error) {
 	t, err := contentType(raw)
 	if err != nil {
 		return nil, err
 	}
+
 	switch t {
 	case ContentTypeText:
 		return decodeContent[TextContent](raw)
+
+	case ContentTypeJSON:
+		return decodeContent[JSONContent](raw)
+
+	case ContentTypeThinking:
+		return decodeContent[ThinkingContent](raw)
+
+	case ContentTypeToolCall:
+		return decodeToolCallContent(raw)
+
 	case ContentTypeImage:
 		return decodeContent[ImageContent](raw)
+
 	case ContentTypeAudio:
 		return decodeContent[AudioContent](raw)
+
 	case ContentTypeVideo:
 		return decodeContent[VideoContent](raw)
+
 	default:
-		return nil, fmt.Errorf("ai: unknown user content type %q", t)
+		return nil, fmt.Errorf(
+			"ai: unknown content type %q",
+			t,
+		)
 	}
+}
+
+func unmarshalUserContent(raw json.RawMessage) (UserContent, error) {
+	content, err := unmarshalContent(raw)
+	if err != nil {
+		return nil, err
+	}
+
+	userContent, ok := content.(UserContent)
+	if !ok {
+		return nil, fmt.Errorf(
+			"ai: %T is not valid tool result content",
+			content,
+		)
+	}
+
+	return userContent, nil
 }
 
 func unmarshalAssistantContent(raw json.RawMessage) (AssistantContent, error) {
-	t, err := contentType(raw)
+	content, err := unmarshalContent(raw)
 	if err != nil {
 		return nil, err
 	}
-	switch t {
-	case ContentTypeText:
-		return decodeContent[TextContent](raw)
-	case ContentTypeJSON:
-		return decodeContent[JSONContent](raw)
-	case ContentTypeThinking:
-		return decodeContent[ThinkingContent](raw)
-	case ContentTypeToolCall:
-		return decodeToolCallContent(raw)
-	default:
-		return nil, fmt.Errorf("ai: unknown assistant content type %q", t)
+
+	assistantContent, ok := content.(AssistantContent)
+	if !ok {
+		return nil, fmt.Errorf(
+			"ai: %T is not valid tool result content",
+			content,
+		)
 	}
+
+	return assistantContent, nil
 }
 
-// decodeToolCallContent is deliberately specialized: Arguments is an
-// interface-backed JSON tree whose numbers must remain exact. The default
-// decoder would turn them into float64 when restoring a persisted transcript,
-// corrupting integer tool arguments above 2^53. Other content decoders retain
-// their existing concrete-number behavior.
+func unmarshalToolResultContent(raw json.RawMessage) (ToolResultContent, error) {
+	content, err := unmarshalContent(raw)
+	if err != nil {
+		return nil, err
+	}
+
+	toolContent, ok := content.(ToolResultContent)
+	if !ok {
+		return nil, fmt.Errorf(
+			"ai: %T is not valid tool result content",
+			content,
+		)
+	}
+
+	return toolContent, nil
+}
+
 func decodeToolCallContent(raw json.RawMessage) (*ToolCallContent, error) {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.UseNumber()
@@ -198,20 +254,11 @@ func decodeToolCallContent(raw json.RawMessage) (*ToolCallContent, error) {
 	return &content, nil
 }
 
-func unmarshalToolResultContent(raw json.RawMessage) (ToolResultContent, error) {
-	t, err := contentType(raw)
-	if err != nil {
-		return nil, err
-	}
-	switch t {
-	case ContentTypeText:
-		return decodeContent[TextContent](raw)
-	case ContentTypeImage:
-		return decodeContent[ImageContent](raw)
-	default:
-		return nil, fmt.Errorf("ai: unknown tool result content type %q", t)
-	}
-}
+// decodeToolCallContent is deliberately specialized: Arguments is an
+// interface-backed JSON tree whose numbers must remain exact. The default
+// decoder would turn them into float64 when restoring a persisted transcript,
+// corrupting integer tool arguments above 2^53. Other content decoders retain
+// their existing concrete-number behavior.
 
 func decodeContent[C any](raw json.RawMessage) (*C, error) {
 	var c C

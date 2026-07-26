@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/zhongys/Daksha/ai"
-	"github.com/zhongys/Daksha/ai/openai"
+	"github.com/zhongys/Daksha/ai/api/openaicompletions/openai"
 )
 
 const apiName = "openai-completions"

@@ -76,10 +76,7 @@ func (s *eventStreamDecoder) Next() bool {
 				event = ""
 				continue
 			}
-			s.evt = Event{
-				Type: event,
-				Data: data.Bytes(),
-			}
+			s.evt = makeEvent(event, data)
 			return true
 		}
 
@@ -103,9 +100,6 @@ func (s *eventStreamDecoder) Next() bool {
 				break
 			}
 			_, s.err = data.WriteRune('\n')
-			if s.err != nil {
-				break
-			}
 		}
 	}
 
@@ -118,10 +112,7 @@ func (s *eventStreamDecoder) Next() bool {
 	// line. After a clean EOF, dispatch their pending data block as if it had
 	// been terminated normally.
 	if data.Len() > 0 {
-		s.evt = Event{
-			Type: event,
-			Data: data.Bytes(),
-		}
+		s.evt = makeEvent(event, data)
 		return true
 	}
 
@@ -195,7 +186,9 @@ func (s *Stream[T]) Next() bool {
 			return false
 		}
 
-		if bytes.Equal(bytes.TrimSuffix(data, []byte("\n")), []byte("[DONE]")) {
+		trimmed := bytes.TrimSpace(data)
+
+		if bytes.Equal(trimmed, []byte("[DONE]")) {
 			s.done = true
 			return false
 		}
@@ -205,7 +198,6 @@ func (s *Stream[T]) Next() bool {
 			return false
 		}
 
-		trimmed := bytes.TrimSpace(data)
 		if len(trimmed) == 0 {
 			s.err = newDecodeStreamError(event, errors.New("empty streaming event data"))
 			return false
@@ -243,7 +235,11 @@ func (s *Stream[T]) Close() error {
 		// already closed
 		return nil
 	}
-	return s.decoder.Close()
+	decoder := s.decoder
+	s.decoder = nil
+	s.done = true
+
+	return decoder.Close()
 }
 
 func cloneEvent(event Event) Event {
@@ -264,5 +260,17 @@ func newDecodeStreamError(event Event, cause error) *StreamError {
 		Message: fmt.Sprintf("failed to decode streaming event: %v", cause),
 		Event:   event,
 		Cause:   cause,
+	}
+}
+
+func makeEvent(event string, data *bytes.Buffer) Event {
+	b := data.Bytes()
+	if len(b) > 0 && b[len(b)-1] == '\n' {
+		b = b[:len(b)-1]
+	}
+
+	return Event{
+		Type: event,
+		Data: b,
 	}
 }

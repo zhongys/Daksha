@@ -6,7 +6,7 @@ import (
 	"strings"
 
 	"github.com/zhongys/Daksha/ai"
-	"github.com/zhongys/Daksha/ai/openai"
+	"github.com/zhongys/Daksha/ai/api/openaicompletions/openai"
 )
 
 // resolvedCompat is the fully-resolved quirk configuration for one request:

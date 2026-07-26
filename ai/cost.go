@@ -2,6 +2,28 @@ package ai
 
 import "math"
 
+// Cost is the derived price of one turn in nano-yuan (10⁻⁹ CNY).
+// Tokens times per-token pricing is the source of truth for billing; Cost is
+// computed from them with pure integer arithmetic and is always reproducible.
+type Cost struct {
+	Input      int64 `json:"input"`
+	Output     int64 `json:"output"`
+	CacheRead  int64 `json:"cacheRead"`
+	CacheWrite int64 `json:"cacheWrite"`
+	Total      int64 `json:"total"`
+}
+
+type Usage struct {
+	Input        int64 `json:"input"`
+	Output       int64 `json:"output"`
+	CacheRead    int64 `json:"cacheRead"`
+	CacheWrite   int64 `json:"cacheWrite"`
+	CacheWrite1h int64 `json:"cacheWrite1h"`
+	Reasoning    int64 `json:"reasoning,omitempty"`
+	TotalTokens  int64 `json:"totalTokens"`
+	Cost         Cost  `json:"cost"`
+}
+
 // Pricing is a model's per-token price in nano-yuan (10⁻⁹ CNY).
 //
 // Vendor price sheets quote yuan per million tokens; the conversion is

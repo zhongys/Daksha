@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	"github.com/zhongys/Daksha/ai"
-	"github.com/zhongys/Daksha/ai/openai"
+	"github.com/zhongys/Daksha/ai/api/openaicompletions/openai"
 )
 
 func marshalParams(t *testing.T, p openai.ChatCompletionNewParams) string {

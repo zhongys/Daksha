@@ -11,7 +11,7 @@ import (
 	"github.com/zhongys/Daksha/agent"
 	"github.com/zhongys/Daksha/ai"
 	"github.com/zhongys/Daksha/ai/api/openaicompletions"
-	"github.com/zhongys/Daksha/ai/openai"
+	"github.com/zhongys/Daksha/ai/api/openaicompletions/openai"
 )
 
 func main() {

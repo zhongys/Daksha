@@ -5,7 +5,7 @@ import (
 	"fmt"
 
 	"github.com/zhongys/Daksha/ai"
-	"github.com/zhongys/Daksha/ai/openai"
+	"github.com/zhongys/Daksha/ai/api/openaicompletions/openai"
 )
 
 // Embedder implements ai.Embedder over the OpenAI-compatible embeddings

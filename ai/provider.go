@@ -1,5 +1,7 @@
 package ai
 
+import "encoding/json"
+
 // Provider describes one endpoint. Vendors that speak the same wire protocol
 // differ only in configuration, so a provider is data, not code: adding a
 // vendor means adding an entry to a Client's registry. Only a genuinely
@@ -27,6 +29,8 @@ type Provider struct {
 	// Compat overrides endpoint quirk detection. Unset fields fall back to
 	// auto-detection from BaseURL.
 	Compat *OpenAICompat
+
+	AdapterConfig json.RawMessage
 	// Extra carries provider-specific request fields merged into the
 	// top-level request JSON, e.g. Qwen's enable_thinking. Client.PutProvider
 	// snapshots values by their JSON representation; Get/List therefore return
